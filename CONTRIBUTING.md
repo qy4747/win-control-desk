@@ -1,92 +1,56 @@
 # 参与贡献
 
-感谢你帮助改进总控台。项目仍处于 Preview / Alpha 阶段，优先接受范围清晰、可验证且不扩大安全边界的改动。
-
-> **维护立场**：`qy4747/win-control-desk` 是 Windows 优先的独立衍生项目，不承诺同步上游或固定审阅周期。普通问题使用本仓库 Issues；Discussions 仅在实际启用后作为反馈入口。
+项目处于 Preview / Alpha，Windows 是主要验收平台，macOS 保留兼容入口。欢迎范围清晰的改进。
 
 ## 开始之前
 
-1. 先搜索已有 Issue 和 Pull Request，避免重复工作。
-2. 较大的功能、配置 schema 变化、进程管理策略或 UI 主题调整，请先开 Issue 说明动机、用户场景和兼容性影响。
-3. 安全漏洞不要公开讨论，按 [`SECURITY.md`](SECURITY.md) 私下报告。
-4. 不要提交本机 `data/`、Application Support、Library Logs、个人路径、完整命令、token、用户图标或未脱敏截图。
+先搜索已有 Issue 和 Pull Request。较大的功能、配置格式或进程管理策略变更，先开 Issue 说明场景和兼容性影响。安全问题按 [SECURITY.md](SECURITY.md) 私下报告，日志、示例和附件遵循其中的[脱敏规则](SECURITY.md#脱敏规则)。
 
 ## 开发环境
 
-- Windows 10/11 x64（主要验收环境）；macOS 兼容分支保留，新增原生行为须单列验收；
-- Python 3.12；
-- Node.js，用于 JavaScript 语法与行为测试；
-- 运行时无第三方 Python 依赖。
+- Python 3.12 为检查基线；运行时支持 3.12+，仅依赖标准库。
+- Node.js 用于 JavaScript 语法和行为检查，不参与日常运行。
+- 前端使用原生 ES Modules，无构建或 CDN。
 
-只有重新生成纹理时才需要开发依赖：
+Windows 启动方式见 [README](README.md)，模块与配置入口见 [开发说明](docs/development.md)。
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python3 -m pip install -r requirements-dev.txt
-```
+仅重新生成图片时需要 `requirements-dev.txt` 中的依赖；请在虚拟环境中安装。生成品牌 `.icns` 还需 macOS `iconutil`。
 
 ## 修改原则
 
-- 后端保持 Python 标准库实现；前端保持原生 ES Modules、无 CDN、无构建。
-- 不得削弱回环绑定、当前 UID、run token、进程组、Host/Origin 或控制令牌等安全校验。
-- 不得按端口直接结束未知进程。
-- 配置变更必须有明确 `schemaVersion`、幂等迁移和升级测试。
-- DOM 列表应按 key 原地更新，避免轮询造成整表闪烁。
-- 危险操作必须有明确确认。
-- 修改 `static/icons/*.svg` 后运行 `make generate-icons`，不要手改 `static/icons.js`。
+- 保留请求授权、当前用户和受控进程身份校验；不得仅凭名称或端口结束未知进程。
+- 配置格式变更提供逐版迁移及升级检查，保留原子写入、备份与损坏保护。
+- 列表按 key 更新，保留键盘操作、焦点和危险操作确认。
+- 视觉样式遵循 [主题说明](static/themes/README.md)。
+- 修改 `static/icons/*.svg` 后运行 `py -3.12 tools/gen_icons.py` 生成 `static/icons.js`。
 
 ## 素材与许可
 
-新增或替换字体、Logo、App Icon、favicon、插画、照片、纹理、声音等素材时，Pull Request 必须同时：
-
-1. 更新 [`ASSET_PROVENANCE.md`](ASSET_PROVENANCE.md)；
-2. 记录能够核实的来源/生成方式、用途、修改、许可和 SHA-256；缺失日期、模型或上游版本明确标注，不伪造凭证；
-3. 需要时更新 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) 并随包加入许可原文；
-4. 确认素材状态不是 `BLOCKED` 或 `TO_REPLACE`。
-
-只有“网上可下载”“AI 生成”或“免费使用”的说明不足以证明可随开源项目再分发。
+新增或替换素材时，更新 [素材台账](ASSET_PROVENANCE.md) 的路径、来源、用途、许可与 SHA-256；未知信息如实标注。第三方素材按需补充 [第三方声明](THIRD_PARTY_NOTICES.md) 和许可原文。发行素材不得处于 `BLOCKED` 或 `TO_REPLACE` 状态。
 
 ## 检查
 
-提交前运行：
+按改动范围选择检查，并在 PR 中记录实际结果：
+
+- **纯文档**：核对事实、相对链接、示例和术语一致性。
+- **代码**：运行项目检查；Windows 原生行为变化补充对应实机验收。macOS 结果单列。
+- **发行范围、许可、素材或打包**：补充发行检查；完整发布步骤见 [发布核对表](RELEASE_CHECKLIST.md)。
 
 ```powershell
 py -3.12 tools/check_project.py
-# macOS：make check
-```
-
-涉及发行范围、许可证、静态资源或打包逻辑时，再运行：
-
-```powershell
 py -3.12 tools/build_release.py --check-only
+# 发行检查需先提交到干净工作树：
 py -3.12 tools/check_project.py --release
-# macOS：make release-check
 ```
 
-Pull Request 应说明：
+Windows 不需要 Make；macOS 可使用 `python3` 或 `make check` / `make release-check`。仓库未配置 GitHub Actions，以上检查在本地运行。
 
-- 改了什么、为什么；
-- 用户可见影响和风险；
-- 执行过的检查及结果；
-- 必要的手工验收步骤；
-- 是否影响配置、数据、进程生命周期、素材许可或发布范围。
+UI 演示与截图使用 [假数据服务](docs/ui-acceptance.md)。可选的 `tests/bridge-control-mode.ps1` 需显式传入可信 Bridge 脚本路径；后台性能测量入口见 [开发说明](docs/development.md#验证入口)。
 
-## 变更记录
+## 提交与变更记录
 
-- 用户可感知的功能、安全与兼容性说明写入 [`CHANGELOG.md`](CHANGELOG.md)，按对应版本维护完整说明。
-- 使用 `Added`、`Changed`、`Fixed`、`Removed` 或 `Security`
-  描述用户结果，不记录实现步骤。
-- 纯缓存清理、过期本地构建产物和不影响行为的内部重构不必写入；
-  Pull Request 中应说明为什么不适用。
-- 发布时核对版本说明、`VERSION` 与目标提交一致；发布日期以实际发布为准。
+一个 PR 解决一个主题，说明改动、验证结果和必要的兼容性影响。UI 改动附相关截图；使用真实作者身份，保留原作者署名。
 
-## Commit 与 Pull Request
+用户可感知的功能、安全或兼容性变化写入 [CHANGELOG.md](CHANGELOG.md) 对应版本，使用 Added、Changed、Fixed、Removed 或 Security 分类。纯文档和不影响行为的内部调整无需更新版本说明。
 
-- 使用简洁、可追溯的 commit；不要使用占位邮箱或伪造作者身份。
-- 一个 Pull Request 尽量只解决一个主题。
-- 不重写他人的历史，不夹带无关格式化或生成文件。
-- 如果 UI 有变化，提供不含个人路径和真实服务信息的脱敏截图。
-- 贡献即表示你有权提交该内容，并同意项目按根目录 `LICENSE` 及对应素材许可分发。
-
-所有参与者都应遵守 [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)。
+贡献内容按根目录 [LICENSE](LICENSE) 及相应素材许可分发。参与项目须遵守 [行为规范](CODE_OF_CONDUCT.md)。

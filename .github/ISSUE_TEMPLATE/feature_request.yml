@@ -1,20 +1,13 @@
 name: 功能建议
-description: 提议一个清晰的本地启动、任务或监测场景
+description: 提议一个本地启动、任务或监测场景
 title: "[Feature] "
 labels:
   - enhancement
 body:
-  - type: checkboxes
-    id: preflight
+  - type: markdown
     attributes:
-      label: 提交前确认
-      options:
-        - label: 我已搜索现有 Issue，没有发现相同建议
-          required: true
-        - label: 该建议仍以本机、当前用户和回环网络为安全边界
-          required: true
-        - label: 内容不含个人路径、真实命令、凭据或未授权素材
-          required: true
+      value: |
+        提交前请搜索已有建议。示例和附件遵循 [脱敏规则](https://github.com/qy4747/win-control-desk/blob/main/SECURITY.md#脱敏规则)。
   - type: textarea
     id: scenario
     attributes:
@@ -34,23 +27,8 @@ body:
     attributes:
       label: 现有替代方式
       description: 当前如何处理，为什么仍不够好？
-  - type: dropdown
-    id: area
-    attributes:
-      label: 主要范围
-      options:
-        - 启动台与服务管理
-        - 批处理任务
-        - 服务与端口监测
-        - 项目识别与诊断
-        - UI、无障碍与主题
-        - 安装、升级与发行
-        - 文档与贡献体验
-        - 其他
-    validations:
-      required: true
   - type: textarea
-    id: risks
+    id: notes
     attributes:
-      label: 风险与兼容性
-      description: 是否影响命令执行、进程生命周期、配置 schema、隐私或素材许可？
+      label: 补充信息
+      description: 例如使用频率、界面示例或兼容性需求
