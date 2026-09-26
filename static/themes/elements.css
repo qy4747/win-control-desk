@@ -1,0 +1,94 @@
+/* Shared material geometry and states. Asset bindings stay in each pack. */
+@import url('./ops.css');
+
+:root {
+  --element-background: none;
+  --element-chrome: none;
+  --element-panel: none;
+  --element-card: none;
+  --element-control: none;
+  --element-frame: none;
+  --element-label-frame: none;
+  --element-decor-a: none;
+  --element-decor-b: none;
+  --element-decor-c: none;
+  --element-corner: none;
+  --element-tile-size: 256px;
+  --element-frame-slice: 64;
+  --element-frame-width: 8px;
+  --element-radius: 6px;
+  --element-decor-a-width: 48px; --element-decor-a-height: 24px;
+  --element-decor-b-width: 18px; --element-decor-b-height: 36px;
+  --element-decor-c-width: 24px; --element-decor-c-height: 24px;
+}
+:root[data-ui-theme^="pack-"] body {
+  background: var(--room) center / cover fixed;
+  color: var(--ink);
+}
+:root[data-ui-theme^="pack-"] :is(.shell, .shell-col, .main, .main-inner) { background: transparent; }
+:root[data-ui-theme^="pack-"] :is(.rail, .topbar) {
+  background: var(--card-2) repeat;
+  background-size: var(--element-tile-size);
+  backdrop-filter: none; border-color: var(--line); box-shadow: var(--shadow);
+}
+:root[data-ui-theme^="pack-"] :is(.ops-scenes, .center-section, .widget, .ov, .file-filters, .file-table-panel, .tbl, .modal, .drawer, .palette, .ops-panel, .ops-menu, .folder-menu-actions, .ops-alert-popover, .ops-resource-popover, .ops-preset-popover) {
+  background: var(--card) repeat;
+  background-size: var(--element-tile-size);
+  border-color: var(--line); border-radius: var(--element-radius);
+  backdrop-filter: none; box-shadow: var(--shadow);
+}
+:root[data-ui-theme^="pack-"] .ops-scenes { border: 1px solid var(--line); }
+:root[data-ui-theme^="pack-"] :is(.app-card, .folder-card) {
+  background: var(--card) repeat;
+  background-size: var(--element-tile-size);
+  border-color: var(--line); border-radius: var(--element-radius);
+  box-shadow: var(--shadow); backdrop-filter: none;
+}
+:root[data-ui-theme^="pack-"] :is(.app-card, .folder-card)::before {
+  content: ''; position: absolute; inset: 0; pointer-events: none;
+  box-sizing: border-box; border: var(--element-frame-width) solid transparent;
+  border-image-slice: var(--element-frame-slice);
+  border-image-width: var(--element-frame-width);
+  border-image-repeat: stretch;
+}
+:root[data-ui-theme^="pack-"] :is(.app-card, .folder-card)::after {
+  content: ''; position: absolute; right: 12px; top: -12px; pointer-events: none;
+  width: var(--element-decor-a-width); height: var(--element-decor-a-height);
+  background: center / contain no-repeat;
+}
+:root[data-ui-theme^="pack-"] :is(.app-card, .folder-card):nth-child(3n + 2)::after {
+  width: var(--element-decor-b-width); height: var(--element-decor-b-height);
+}
+:root[data-ui-theme^="pack-"] :is(.app-card, .folder-card):nth-child(3n)::after {
+  width: var(--element-decor-c-width); height: var(--element-decor-c-height);
+}
+:root[data-ui-theme^="pack-"] .rail-foot { position: relative; }
+:root[data-ui-theme^="pack-"] .rail-foot::after {
+  content: ''; position: absolute; right: 0; bottom: 0; width: 80px; height: 80px;
+  background: right bottom / contain no-repeat;
+  pointer-events: none; opacity: .55;
+}
+:root[data-ui-theme^="pack-"] :is(.btn, .ibtn, .icon-btn, .rail-btn, .mini-tab, .ops-tag, .ops-scene, .ops-package, .ops-picker-choice, .ops-preset-app-toggle) {
+  background-size: var(--element-tile-size);
+  border-radius: var(--element-radius);
+  border-image-slice: 24; border-image-width: 3px;
+}
+/* Status borders must remain visible above the pack's decorative paper frame. */
+:root[data-ui-theme^="pack-"] .ops-preset-popover .ops-preset-app-toggle { border-image: none; }
+:root[data-ui-theme^="pack-"] :is(.rail-btn.active, .mini-tab.active, .ops-tag[aria-pressed="true"], .ops-scene[aria-pressed="true"]) {
+  background-color: var(--accent); color: var(--on-accent); border-color: var(--accent);
+}
+:root[data-ui-theme^="pack-"] :is(.app-card.has-error, .app-card.has-alert, .folder-card.drop-target) { outline: 2px solid var(--red); outline-offset: 1px; }
+:root[data-ui-theme^="pack-"] .folder-card.drop-target { outline-color: var(--accent); }
+:root[data-ui-theme^="pack-"] .ops-more > .ops-menu { background: transparent; box-shadow: none; }
+:root[data-ui-theme^="pack-"] :is(.view.active, .anim-in) { animation: none; }
+@media (max-width: 600px) {
+  :root[data-ui-theme^="pack-"] :is(.app-card, .folder-card, .rail-foot)::after { display: none; }
+}
+@media (prefers-contrast: more), (forced-colors: active) {
+  :root[data-ui-theme^="pack-"] {
+    --element-background: none !important; --element-chrome: none !important; --element-panel: none !important;
+    --element-card: none !important; --element-control: none !important; --element-frame: none !important; --element-label-frame: none !important;
+    --element-decor-a: none !important; --element-decor-b: none !important; --element-decor-c: none !important; --element-corner: none !important;
+  }
+}

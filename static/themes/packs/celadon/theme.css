@@ -1,0 +1,221 @@
+/* 青瓷晨雾。瓷盘、瓷条、印和珠子只在本包里，不改极简、Apple、雨境和剪纸。 */
+@import url('../../elements.css');
+
+:root {
+  --element-background: url('./assets/glaze.webp');
+  --element-chrome: url('./assets/glaze.webp');
+  --element-panel: url('./assets/glaze.webp');
+  --element-card: url('./assets/card.png');
+  --element-control: url('./assets/strip.png');
+  --element-seal: url('./assets/seal.png');
+  --element-bead: url('./assets/bead.png');
+  --element-frame: none;
+  --element-label-frame: none;
+  --element-decor-a: none;
+  --element-decor-b: none;
+  --element-decor-c: none;
+  --element-corner: none;
+  --element-radius: 18px;
+  --tag-drawer-duration: 240ms; --tag-drawer-closed: translateY(-8px) scaleY(.98);
+  --glaze-filter: brightness(1);
+  --glaze-tint: #f4f7f4;
+
+  --room: #d5e2da;
+  --card: #f4f7f4;
+  --card-2: #e5eee8;
+  --paper: var(--card);
+  --bg: var(--room);
+  --ink: #1c2c26;
+  --ink-2: #3d5248;
+  --ink-3: #5c7268;
+  --ink-4: #6d8278;
+  --line: rgba(36, 72, 58, 0.14);
+  --line-2: rgba(36, 72, 58, 0.24);
+  --accent: #2f6a56;
+  --accent-ink: var(--accent);
+  --on-accent: #f7faf7;
+  --green: #2d7a52;
+  --red: #c4503e;
+  --amber: #a56a24;
+  --purple: #6d5a8c;
+  --shadow: 0 8px 16px rgba(48, 72, 60, 0.12);
+  --shadow-lg: 0 14px 26px rgba(48, 72, 60, 0.18);
+  --focus-ring: 0 0 0 3px rgba(47, 106, 86, 0.35);
+}
+:root[data-theme="dark"] {
+  --room: #101816;
+  --card: #24312c;
+  --card-2: #1b2622;
+  --ink: #e7f1eb;
+  --ink-2: #c5d5cc;
+  --ink-3: #9fb0a6;
+  --ink-4: #7e9187;
+  --line: rgba(214, 232, 222, 0.14);
+  --line-2: rgba(214, 232, 222, 0.26);
+  --accent: #8fbfa4;
+  --on-accent: #102019;
+  --green: #7dcea0;
+  --red: #e08b7c;
+  --amber: #e0b56a;
+  --purple: #c4b0dc;
+  --shadow: 0 10px 18px rgba(0, 0, 0, 0.28);
+  --shadow-lg: 0 16px 28px rgba(0, 0, 0, 0.4);
+  --focus-ring: 0 0 0 3px rgba(143, 191, 164, 0.4);
+  --glaze-filter: brightness(0.46) saturate(0.72);
+  --glaze-tint: #d5e4dc;
+}
+
+:root[data-ui-theme^="pack-"] body {
+  background: #dfeae4 var(--element-background) center / 240px repeat fixed;
+  background-blend-mode: multiply;
+  color: var(--ink);
+}
+:root[data-ui-theme^="pack-"] :is(.shell, .shell-col, .main, .main-inner) { background: transparent; }
+
+/* 整页是一块大瓷盘，小卡片再叠上去。九宫格只拉中间的素釉，盘沿保持厚度。 */
+:root[data-ui-theme^="pack-"] .main-inner { position: relative; isolation: isolate; }
+:root[data-ui-theme^="pack-"] .main-inner::before {
+  content: ''; position: absolute; inset: 10px -6px 28px; z-index: -1; pointer-events: none;
+  border-image: var(--element-card) 120 90 116 90 fill / 34px 28px 32px 28px / 0 stretch;
+  filter: var(--glaze-filter) drop-shadow(7px 8px 0 rgba(158, 176, 166, 0.55));
+}
+:root[data-ui-theme^="pack-"] :is(.center-section, .ops-scenes, .tbl, .modal, .drawer, .palette, .port-discovery, .file-table-panel, .file-filters, .widget) {
+  isolation: isolate; background: transparent; border-color: transparent; box-shadow: none;
+}
+/* Floating panels keep their fixed/absolute placement from the behavior layer. */
+:root[data-ui-theme^="pack-"] :is(.center-section, .ops-scenes, .tbl, .modal, .file-table-panel, .file-filters, .widget) {
+  position: relative;
+}
+:root[data-ui-theme^="pack-"] :is(.center-section, .ops-scenes, .tbl, .modal, .drawer, .palette, .port-discovery, .file-table-panel, .file-filters, .widget)::before {
+  content: ''; position: absolute; inset: -2px; z-index: -1; pointer-events: none;
+  border-image: var(--element-card) 120 90 116 90 fill / 22px 18px 20px 18px / 0 stretch;
+  filter: var(--glaze-filter) drop-shadow(0 6px 8px rgba(48, 72, 60, 0.14));
+}
+
+:root[data-ui-theme^="pack-"] .rail {
+  background: #3d5f52 var(--element-chrome) center / 180px repeat;
+  background-blend-mode: multiply;
+  color: #f4faf6;
+  border-right: 1px solid rgba(255, 255, 255, 0.14);
+}
+:root[data-ui-theme^="pack-"] :is(.rail-btn, .rail-conn, .rail-host, .rail-ver) { color: rgba(244, 250, 246, 0.8); }
+:root[data-ui-theme^="pack-"] .rail-btn {
+  background: transparent; border-color: transparent; border-image: none; box-shadow: none;
+}
+:root[data-ui-theme^="pack-"] .rail-btn:hover { color: #f4faf6; background: rgba(255, 255, 255, 0.1); }
+:root[data-ui-theme^="pack-"] .rail-foot { border-top-color: rgba(255, 255, 255, 0.16); color: rgba(244, 250, 246, 0.72); }
+:root[data-ui-theme^="pack-"] .rail-foot::after {
+  content: ''; width: 42px; height: 40px; right: 8px; bottom: auto; top: -46px; opacity: 1;
+  background: var(--element-bead) center / contain no-repeat;
+  filter: var(--glaze-filter);
+}
+:root[data-ui-theme^="pack-"] .topbar {
+  background: #f7f8f5 var(--element-chrome) center / 220px repeat;
+  background-blend-mode: multiply;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.66);
+}
+
+:root[data-ui-theme^="pack-"] :is(.app-card, .folder-card) {
+  isolation: isolate; background: transparent; border-color: transparent; box-shadow: none; border-radius: 0;
+}
+:root[data-ui-theme^="pack-"] :is(.app-card, .folder-card)::before {
+  content: ''; position: absolute; z-index: -1; inset: -4px; pointer-events: none;
+  border: 0; border-radius: 0;
+  border-image: var(--element-card) 120 90 116 90 fill / 22px 18px 20px 18px / 0 stretch;
+  filter: var(--glaze-filter) drop-shadow(0 8px 8px rgba(48, 72, 60, 0.16));
+}
+:root[data-ui-theme^="pack-"] :is(.app-card, .folder-card):nth-child(3n + 2)::before { transform: rotate(.35deg); }
+:root[data-ui-theme^="pack-"] :is(.app-card, .folder-card):nth-child(3n)::before { transform: rotate(-.3deg); }
+:root[data-ui-theme^="pack-"] :is(.app-card, .folder-card)::after,
+:root[data-ui-theme^="pack-"] :is(.app-card, .folder-card):nth-child(3n)::after,
+:root[data-ui-theme^="pack-"] :is(.app-card, .folder-card):nth-child(3n + 2)::after {
+  content: ''; left: auto; right: 8px; top: -20px; width: 36px; height: 36px; margin: 0;
+  background: var(--element-seal) center / contain no-repeat;
+  transform: rotate(-8deg); opacity: 1; pointer-events: none;
+  filter: var(--glaze-filter);
+}
+:root[data-ui-theme^="pack-"] .add-card::after { content: none; }
+:root[data-ui-theme^="pack-"] .ops-more > summary { display: none; }
+:root[data-ui-theme^="pack-"] .app-name { padding-right: 8px; }
+:root[data-ui-theme^="pack-"] .ov {
+  position: relative; isolation: isolate; background: transparent; border-color: transparent; box-shadow: none;
+}
+:root[data-ui-theme^="pack-"] .ov::before {
+  content: ''; position: absolute; inset: -3px; z-index: -1; pointer-events: none;
+  border-image: var(--element-card) 120 90 116 90 fill / 14px 12px 13px 12px / 0 stretch;
+  filter: var(--glaze-filter) drop-shadow(0 5px 6px rgba(48, 72, 60, 0.12));
+}
+:root[data-ui-theme^="pack-"] .app-card.running { outline: 2px solid color-mix(in srgb, var(--green) 70%, transparent); outline-offset: 3px; }
+:root[data-ui-theme^="pack-"] .app-cmd {
+  background: rgba(90, 120, 104, 0.1); border-color: transparent; border-radius: 10px;
+}
+:root[data-ui-theme^="pack-"] .ops-more > .ops-menu { background: transparent; background-image: none; box-shadow: none; }
+
+/* 按钮和标签用同一根瓷条。状态点自己占用 ::before，不改成瓷面。 */
+:root[data-ui-theme^="pack-"] :is(button.btn, .qa-chip, .fchip, .ops-tag, .ops-scene, .mini-tab, .cmdk-trigger, .console-control, .ibtn, .icon-btn, .nav-btn):not(.ops-system-status):not(.ops-alert-badge) {
+  isolation: isolate; position: relative; border-image: none;
+  background: transparent; border-color: transparent; box-shadow: none;
+}
+:root[data-ui-theme^="pack-"] :is(button.btn, .qa-chip, .fchip, .ops-tag, .ops-scene, .mini-tab, .cmdk-trigger, .console-control, .ibtn, .icon-btn, .nav-btn):not(.ops-system-status):not(.ops-alert-badge)::before {
+  content: ''; position: absolute; inset: -2px; z-index: -1; pointer-events: none;
+  background: var(--glaze-tint) var(--element-control) center / 100% 100% no-repeat;
+  background-blend-mode: multiply;
+  mask: var(--element-control) center / 100% 100% no-repeat;
+  -webkit-mask: var(--element-control) center / 100% 100% no-repeat;
+  filter: var(--glaze-filter);
+}
+:root[data-ui-theme^="pack-"] :is(.ops-system-status.has-alert, .ops-alert-badge) { color: var(--red); }
+:root[data-ui-theme^="pack-"] :is(.btn-accent, .mini-tab.active, .ops-tag[aria-pressed="true"], .ops-scene[aria-pressed="true"], .fchip.active, .nav-btn.active) {
+  --glaze-tint: var(--accent); color: var(--on-accent); background: transparent; border-color: transparent;
+}
+:root[data-ui-theme^="pack-"] .rail-btn.active {
+  isolation: isolate; position: relative; background: transparent; border-color: transparent; color: #245246;
+}
+:root[data-ui-theme^="pack-"] .rail-btn.active::before {
+  content: ''; position: absolute; inset: 0; z-index: -1; pointer-events: none;
+  background: #f7f8f5 var(--element-control) center / 100% 100% no-repeat;
+  background-blend-mode: multiply;
+  mask: var(--element-control) center / 100% 100% no-repeat;
+  -webkit-mask: var(--element-control) center / 100% 100% no-repeat;
+  filter: var(--glaze-filter);
+}
+:root[data-ui-theme^="pack-"] .btn-stop { --glaze-tint: #f7f3f1; color: var(--red); }
+:root[data-ui-theme^="pack-"] .ops-scene.is-current { border-bottom: 3px solid var(--accent); }
+:root[data-ui-theme^="pack-"] .ops-scene.is-pending { border-style: dashed; }
+:root[data-ui-theme^="pack-"] :is(.view-head h2, .center-section h3) {
+  position: relative; isolation: isolate; width: fit-content; padding: 5px 16px 7px; background: none;
+}
+:root[data-ui-theme^="pack-"] :is(.view-head h2, .center-section h3)::before {
+  content: ''; position: absolute; inset: 0; z-index: -1; pointer-events: none;
+  background: var(--element-control) center / 100% 100% no-repeat;
+  filter: var(--glaze-filter);
+}
+:root[data-ui-theme^="pack-"] :is(input:not([type="checkbox"]):not([type="range"]), select, textarea) {
+  background: var(--card-2) var(--element-panel) center / 180px repeat;
+  background-blend-mode: multiply; border-radius: 10px;
+}
+
+:root[data-ui-theme^="pack-"][data-theme="dark"] .rail {
+  background-color: #15211c; border-right-color: rgba(214, 232, 222, 0.1);
+}
+:root[data-ui-theme^="pack-"][data-theme="dark"] .topbar {
+  background-color: #1a2823; border-bottom-color: rgba(214, 232, 222, 0.12);
+}
+:root[data-ui-theme^="pack-"][data-theme="dark"] .rail-btn.active { color: #163028; }
+:root[data-ui-theme^="pack-"][data-theme="dark"] .app-cmd { background: rgba(0, 0, 0, 0.22); }
+:root[data-ui-theme^="pack-"] .tone-blue { --tone: #3d7a78; }
+:root[data-ui-theme^="pack-"] .tone-cyan { --tone: #3e8f7c; }
+:root[data-ui-theme^="pack-"] .tone-pink { --tone: #b96a74; }
+
+@media (max-width: 1100px) {
+  :root[data-ui-theme^="pack-"] .rail-foot::after { display: none; }
+}
+@media (prefers-contrast: more), (forced-colors: active) {
+  :root[data-ui-theme^="pack-"] body { background: var(--room); }
+  :root[data-ui-theme^="pack-"] :is(.main-inner, .center-section, .ops-scenes, .tbl, .widget, .ov, .app-card, .folder-card)::before { display: none; }
+  :root[data-ui-theme^="pack-"] :is(.app-card, .folder-card) { background: var(--card); border: 1px solid currentColor; }
+  :root[data-ui-theme^="pack-"] :is(.app-card, .folder-card)::after,
+  :root[data-ui-theme^="pack-"] .rail-foot::after { display: none; }
+  :root[data-ui-theme^="pack-"] :is(button.btn, .qa-chip, .fchip, .ops-tag, .ops-scene, .rail-btn)::before { display: none; }
+  :root[data-ui-theme^="pack-"] :is(.btn-accent, .rail-btn.active, .ops-tag[aria-pressed="true"]) { background: var(--accent); color: var(--on-accent); }
+}

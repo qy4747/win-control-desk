@@ -1,0 +1,5722 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""总控台后端（单文件，仅 Python 3 标准库）。
+
+本地服务监控 + 快速启动台：
+    python3 server.py  →  绑定 127.0.0.1，端口 9600 起（被占 +1，最多 10 个）
+Windows：
+    py -3 server.py  →  同样绑定 127.0.0.1（数据目录 %APPDATA%\总控台）
+API 契约与实现要点见 AGENTS.md。
+"""
+
+import glob
+import functools
+import errno
+import hashlib
+import json
+import logging
+import os
+import re
+import secrets
+import base64
+import shlex
+import shutil
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.parse
+import urllib.request
+import webbrowser
+import copy
+from contextlib import contextmanager
+from ops_model import APP_FIELDS, DEFAULT_RULES, validate_app_extra, validate_stop_action, reconcile_app_presets
+from http.cookies import SimpleCookie
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+try:
+    import fcntl  # POSIX 专属：Windows 上不存在，实例锁改用 msvcrt
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
+
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
+    _KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _ADVAPI32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    _NTDLL = ctypes.WinDLL("ntdll", use_last_error=True)
+    _KERNEL32.OpenProcess.restype = wintypes.HANDLE
+    _KERNEL32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                      wintypes.DWORD]
+    _KERNEL32.ReadProcessMemory.restype = wintypes.BOOL
+    _KERNEL32.ReadProcessMemory.argtypes = [
+        wintypes.HANDLE, wintypes.LPCVOID, wintypes.LPVOID,
+        ctypes.c_size_t, ctypes.c_void_p]
+    _KERNEL32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _KERNEL32.CloseHandle.restype = wintypes.BOOL
+    _KERNEL32.GetExitCodeProcess.restype = wintypes.BOOL
+    _KERNEL32.GetExitCodeProcess.argtypes = [wintypes.HANDLE,
+                                             ctypes.POINTER(wintypes.DWORD)]
+    _KERNEL32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(ctypes.c_ulonglong)] * 4
+    _ADVAPI32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    _ADVAPI32.OpenProcessToken.restype = wintypes.BOOL
+    _ADVAPI32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD)]
+    _ADVAPI32.GetTokenInformation.restype = wintypes.BOOL
+    _ADVAPI32.GetLengthSid.argtypes = [wintypes.LPVOID]
+    _ADVAPI32.GetLengthSid.restype = wintypes.DWORD
+    _NTDLL.NtQueryInformationProcess.restype = wintypes.LONG
+    _NTDLL.NtQueryInformationProcess.argtypes = [
+        wintypes.HANDLE, wintypes.ULONG, wintypes.LPVOID,
+        wintypes.ULONG, ctypes.c_void_p]
+
+    def _win_owner_uid(pid):
+        """返回进程所有者 SID 的稳定指纹；不可访问或已退出时返回 None。"""
+        process = _KERNEL32.OpenProcess(0x1000, False, int(pid))
+        if not process:  # PROCESS_QUERY_LIMITED_INFORMATION
+            return None
+        token = wintypes.HANDLE()
+        try:
+            if not _ADVAPI32.OpenProcessToken(
+                    process, 0x0008, ctypes.byref(token)):  # TOKEN_QUERY
+                return None
+            needed = wintypes.DWORD()
+            _ADVAPI32.GetTokenInformation(
+                token, 1, None, 0, ctypes.byref(needed))  # TokenUser
+            if needed.value <= 0:
+                return None
+            payload = ctypes.create_string_buffer(needed.value)
+            if not _ADVAPI32.GetTokenInformation(
+                    token, 1, payload, needed, ctypes.byref(needed)):
+                return None
+            sid = ctypes.c_void_p.from_buffer(payload).value
+            sid_length = _ADVAPI32.GetLengthSid(sid) if sid else 0
+            if sid_length <= 0:
+                return None
+            digest = hashlib.sha256(
+                ctypes.string_at(sid, sid_length)).digest()
+            return int.from_bytes(digest[:8], "big")
+        finally:
+            if token:
+                _KERNEL32.CloseHandle(token)
+            _KERNEL32.CloseHandle(process)
+else:  # pragma: no cover - macOS
+    ctypes = None
+    wintypes = None
+    _KERNEL32 = None
+    _ADVAPI32 = None
+    _NTDLL = None
+
+    def _win_owner_uid(pid):
+        return None
+
+IS_WIN = sys.platform == "win32"
+IS_MAC = sys.platform == "darwin"
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+VERSION_PATH = os.path.join(BASE_DIR, "VERSION")
+LEGACY_DATA_DIR = os.path.join(BASE_DIR, "data")
+if IS_WIN:
+    _appdata = os.environ.get("APPDATA") or os.path.expanduser("~")
+    _localappdata = os.environ.get("LOCALAPPDATA") or _appdata
+    DEFAULT_DATA_DIR = os.path.join(_appdata, "总控台")
+    DEFAULT_LOGS_DIR = os.path.join(_localappdata, "总控台", "Logs")
+else:
+    DEFAULT_DATA_DIR = os.path.expanduser(
+        "~/Library/Application Support/总控台")
+    DEFAULT_LOGS_DIR = os.path.expanduser("~/Library/Logs/总控台")
+
+
+def resolve_runtime_dir(name, default):
+    """解析专用运行目录，拒绝空值、相对路径和过宽目标。"""
+    if name not in os.environ:
+        return os.path.abspath(default), False
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        raise RuntimeError("%s 不能为空" % name)
+    expanded = os.path.expanduser(raw)
+    if not os.path.isabs(expanded):
+        raise RuntimeError("%s 必须是绝对路径" % name)
+    path = os.path.abspath(expanded)
+    forbidden = {os.path.abspath(os.sep), os.path.abspath(os.path.expanduser("~")),
+                 os.path.abspath(BASE_DIR)}
+    if path in forbidden:
+        raise RuntimeError("%s 必须指向专用子目录" % name)
+    return path, True
+
+
+DATA_DIR, DATA_DIR_OVERRIDDEN = resolve_runtime_dir(
+    "CONSOLE_DATA_DIR", DEFAULT_DATA_DIR)
+ICONS_DIR = os.path.join(DATA_DIR, "icons")
+LOGS_DIR, LOGS_DIR_OVERRIDDEN = resolve_runtime_dir(
+    "CONSOLE_LOG_DIR", DEFAULT_LOGS_DIR)
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+THEMES_DIR = os.path.join(STATIC_DIR, "themes")
+CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
+INSTANCE_LOCK_PATH = os.path.join(DATA_DIR, "console.lock")
+
+CURRENT_SCHEMA_VERSION = 8
+
+# 默认 UI 主题：新安装与无偏好回退均使用它，主题清单中固定排首位。
+DEFAULT_UI_THEME = "ops"
+
+
+def read_project_version(path=VERSION_PATH):
+    """读取根目录 VERSION。失败时保持服务可诊断，但标记为降级。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            value = f.read(128).strip()
+        if not re.fullmatch(
+                r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
+                r"(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?", value):
+            raise ValueError("VERSION 不是合法的 SemVer")
+        return value, None
+    except (OSError, UnicodeError, ValueError) as e:
+        return "0.0.0+unknown", str(e)
+
+
+APP_VERSION, VERSION_LOAD_ERROR = read_project_version()
+
+HOST = "127.0.0.1"
+PORT_START = 9600
+PORT_TRIES = 10
+SUBPROCESS_TIMEOUT = 5          # lsof/ps 等子进程超时（秒）
+MAX_ICON_BYTES = 5 * 1024 * 1024
+MAX_JSON_BYTES = 1 * 1024 * 1024
+MAX_DETECT_FILE_BYTES = 2 * 1024 * 1024
+MAX_LOG_BYTES = 10 * 1024 * 1024
+LOG_BACKUPS = 3
+LOG_MAINTENANCE_SEC = 30
+STARTUP_PROBE_SEC = 0.25
+APP_STOP_TIMEOUT_SEC = 5.0
+RUN_TOKEN_ENV = "CONSOLE_RUN_TOKEN"
+RUN_TOKEN_ARG_PREFIX = "console-run:"
+TASK_CANCELED_EXIT_CODE = 130
+
+SELF_PID = os.getpid()
+SELF_UID = (_win_owner_uid(SELF_PID) if IS_WIN else os.getuid())
+if SELF_UID is None:  # 当前进程令牌正常情况下始终可读；异常时仍保持拒绝式过滤。
+    SELF_UID = -1
+ICON_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".ico")
+LOG = logging.getLogger("console")
+LOG_LOCK = threading.RLock()
+_LAUNCHER_LOG_STREAM = None
+MANUAL_STOP_LOCK = threading.RLock()
+MANUAL_STOP_TOKENS = set()
+
+
+def classify_task_exit(code):
+    """把一次性任务的退出码归一为稳定的产品语义。"""
+    if code == 0:
+        return "succeeded"
+    if code == TASK_CANCELED_EXIT_CODE:
+        return "canceled"
+    return "failed"
+
+
+def public_last_exit(app):
+    """兼容旧配置：只在 API 输出时补齐任务状态，不改写磁盘。"""
+    value = app.get("lastExit")
+    if not isinstance(value, dict):
+        return value
+    result = dict(value)
+    if (app.get("kind") or "service") == "task":
+        # 旧版把“总控台按钮停止”记作 canceled + null；新协议中它是 stopped。
+        if result.get("status") == "canceled" and result.get("code") is None:
+            result["status"] = "stopped"
+        elif (result.get("status") not in
+              {"succeeded", "canceled", "failed", "stopped"}
+              and isinstance(result.get("code"), int)):
+            result["status"] = classify_task_exit(result["code"])
+    return result
+
+
+STATIC_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".ico": "image/x-icon",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".otf": "font/otf",
+    ".woff2": "font/woff2",
+}
+
+PLACEHOLDER_HTML = """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>总控台</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#f5f5f7;color:#1d1d1f}
+.card{background:#fff;border:1px solid rgba(0,0,0,.06);border-radius:14px;padding:36px 44px;box-shadow:0 8px 30px rgba(0,0,0,.08);max-width:540px;text-align:center}
+h1{font-size:20px;margin:0 0 14px}p{color:#6e6e73;font-size:14px;line-height:1.8;margin:6px 0}
+code{background:#f5f5f7;border:1px solid rgba(0,0,0,.05);border-radius:6px;padding:2px 7px;font-family:ui-monospace,Menlo,monospace;font-size:13px}
+</style></head>
+<body><div class="card">
+<h1>🖥 总控台后端运行中</h1>
+<p>前端文件 <code>static/index.html</code> 尚未提供，界面暂不可用。</p>
+<p>API 已就绪：<code>GET /api/state</code></p>
+</div></body></html>"""
+
+APP_ROUTE_RE = re.compile(
+    r"^/api/apps/([0-9a-fA-F]{8})(?:/(start|stop|restart|icon|exe-icon|logs|favicon|diagnose|attach))?$")
+
+
+# ---------------------------------------------------------------- 运行目录
+
+def _ensure_private_dir(path):
+    if os.path.islink(path):
+        raise OSError("私有运行目录不能是符号链接: %s" % path)
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    if os.path.islink(path) or not os.path.isdir(path):
+        raise OSError("私有运行路径不是安全目录: %s" % path)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        LOG.warning("无法收紧目录权限: %s", path)
+
+
+def _copy_private_regular_file(source, target):
+    """不跟随符号链接地复制普通文件，目标权限固定为 0600。"""
+    try:
+        source_stat = os.lstat(source)
+    except OSError:
+        return False
+    if not stat.S_ISREG(source_stat.st_mode):
+        return False
+    source_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    source_fd = os.open(source, source_flags)
+    try:
+        target_fd = os.open(
+            target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(os.dup(source_fd), "rb") as src, \
+                    os.fdopen(target_fd, "wb") as dst:
+                target_fd = -1
+                shutil.copyfileobj(src, dst, length=1024 * 1024)
+                dst.flush()
+                os.fsync(dst.fileno())
+        finally:
+            if target_fd >= 0:
+                os.close(target_fd)
+    finally:
+        os.close(source_fd)
+    os.chmod(target, 0o600)
+    return True
+
+
+def _install_migrated_directory(target, populate):
+    """在目标不存在时原子安装一份迁移副本。"""
+    if os.path.lexists(target):
+        return False
+    parent = os.path.dirname(target) or "."
+    # parent 可能是用户共用的 ~/Library/Application Support，
+    # 只确保存在，不擅自改它的现有权限。
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    staging = tempfile.mkdtemp(prefix=".console-migration-", dir=parent)
+    installed = False
+    try:
+        os.chmod(staging, 0o700)
+        populate(staging)
+        try:
+            os.rename(staging, target)
+            installed = True
+        except OSError as e:
+            # 另一个同时启动的实例可能已经完成迁移。
+            if not os.path.lexists(target) or e.errno not in (
+                    errno.EEXIST, errno.ENOTEMPTY):
+                raise
+        return installed
+    finally:
+        if not installed and os.path.isdir(staging):
+            shutil.rmtree(staging)
+
+
+def migrate_legacy_runtime_data(
+        data_dir=DATA_DIR, logs_dir=LOGS_DIR,
+        legacy_data_dir=LEGACY_DATA_DIR,
+        data_overridden=DATA_DIR_OVERRIDDEN,
+        logs_overridden=LOGS_DIR_OVERRIDDEN):
+    """首次运行时将项目内旧数据复制到 macOS 用户目录。
+
+    只在对应目标完全不存在且没有显式环境变量覆盖时执行。
+    旧文件不会被删除或改权限。
+    """
+    result = {"dataMigrated": False, "logsMigrated": False}
+    legacy_data_dir = os.path.abspath(legacy_data_dir)
+    data_dir = os.path.abspath(data_dir)
+    logs_dir = os.path.abspath(logs_dir)
+
+    if (not data_overridden and data_dir != legacy_data_dir
+            and os.path.isdir(legacy_data_dir)
+            and not os.path.lexists(data_dir)):
+        def populate_data(staging):
+            for name in ("config.json", "config.json.bak"):
+                _copy_private_regular_file(
+                    os.path.join(legacy_data_dir, name),
+                    os.path.join(staging, name))
+            source_icons = os.path.join(legacy_data_dir, "icons")
+            if os.path.isdir(source_icons) and not os.path.islink(source_icons):
+                target_icons = os.path.join(staging, "icons")
+                os.mkdir(target_icons, 0o700)
+                for name in os.listdir(source_icons):
+                    if os.path.basename(name) != name:
+                        continue
+                    _copy_private_regular_file(
+                        os.path.join(source_icons, name),
+                        os.path.join(target_icons, name))
+
+        result["dataMigrated"] = _install_migrated_directory(
+            data_dir, populate_data)
+
+    legacy_logs = os.path.join(legacy_data_dir, "logs")
+    if (not logs_overridden and logs_dir != legacy_logs
+            and os.path.isdir(legacy_logs) and not os.path.islink(legacy_logs)
+            and not os.path.lexists(logs_dir)):
+        def populate_logs(staging):
+            for name in os.listdir(legacy_logs):
+                if os.path.basename(name) != name:
+                    continue
+                _copy_private_regular_file(
+                    os.path.join(legacy_logs, name),
+                    os.path.join(staging, name))
+
+        result["logsMigrated"] = _install_migrated_directory(
+            logs_dir, populate_logs)
+    return result
+
+
+def prepare_runtime_storage():
+    migration = migrate_legacy_runtime_data()
+    for private_dir in (DATA_DIR, ICONS_DIR, LOGS_DIR):
+        _ensure_private_dir(private_dir)
+    for path in (CONFIG_PATH, CONFIG_PATH + ".bak", INSTANCE_LOCK_PATH):
+        try:
+            if stat.S_ISREG(os.lstat(path).st_mode):
+                os.chmod(path, 0o600)
+        except OSError:
+            pass
+    for directory in (ICONS_DIR, LOGS_DIR):
+        try:
+            entries = os.scandir(directory)
+        except OSError:
+            continue
+        with entries:
+            for entry in entries:
+                try:
+                    if entry.is_file(follow_symlinks=False):
+                        os.chmod(entry.path, 0o600)
+                except OSError:
+                    LOG.warning("无法收紧文件权限: %s", entry.path)
+    return migration
+
+
+def write_private_bytes(path, payload):
+    """以 0600 权限写入用户数据文件。"""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(payload)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(path, 0o600)
+
+
+# ---------------------------------------------------------------- 配置
+
+
+class ConfigSchemaError(ValueError):
+    pass
+
+
+class FutureConfigSchemaError(ConfigSchemaError):
+    pass
+
+
+def migrate_config_v0_to_v1(raw):
+    """旧配置没有 schemaVersion；v1 只建立显式版本基线。"""
+    migrated = dict(raw)
+    migrated["schemaVersion"] = 1
+    return migrated
+
+
+def migrate_config_v1_to_v2(raw):
+    raw['schemaVersion'] = 2
+    raw.setdefault('rules', copy.deepcopy(DEFAULT_RULES))
+    raw.setdefault('presets', [])
+    raw.setdefault('activePreset', None)
+    for app in raw.get('apps', []):
+        app.setdefault('expectedRunning', bool((app.get('kind') or 'service') == 'service'
+                                             and (app.get('runToken') or app.get('attached'))))
+    return raw
+
+
+def migrate_config_v2_to_v3(raw):
+    raw['schemaVersion'] = 3
+    raw.setdefault('ignoredAlerts', {})
+    for app in raw.get('apps', []):
+        if isinstance(app, dict):
+            app.setdefault('cardButtons', None)
+    return raw
+
+
+def migrate_config_v3_to_v4(raw):
+    raw['schemaVersion'] = 4
+    raw.setdefault('alertOverrides', {})
+    return raw
+
+
+def migrate_config_v4_to_v5(raw):
+    raw['schemaVersion'] = 5
+    for app in raw.get('apps', []):
+        if isinstance(app, dict):
+            app.setdefault('windowBinding', None)
+    return raw
+
+
+def migrate_config_v5_to_v6(raw):
+    raw['schemaVersion'] = 6
+    for app in raw.get('apps', []):
+        if isinstance(app, dict):
+            app.setdefault('instanceMatch', None)
+    return raw
+
+
+def migrate_config_v6_to_v7(raw):
+    from file_tools import DEFAULT_ES_PATH
+    raw['schemaVersion'] = 7
+    raw.setdefault('folders', [])
+    raw.setdefault('fileSearch', {'esPath': DEFAULT_ES_PATH})
+    return raw
+
+
+def migrate_config_v7_to_v8(raw):
+    raw['schemaVersion'] = 8
+    raw.setdefault('directorySnapshots', {})
+    return raw
+
+
+CONFIG_MIGRATIONS = {0: migrate_config_v0_to_v1, 1: migrate_config_v1_to_v2,
+                     2: migrate_config_v2_to_v3, 3: migrate_config_v3_to_v4,
+                     4: migrate_config_v4_to_v5, 5: migrate_config_v5_to_v6,
+                     6: migrate_config_v6_to_v7, 7: migrate_config_v7_to_v8}
+
+
+def migrate_config(raw):
+    """将任意已支持的旧 schema 逐版幂等迁移到当前版本。"""
+    if not isinstance(raw, dict):
+        raise ConfigSchemaError("配置根节点必须是 JSON 对象")
+    version = raw.get("schemaVersion", 0)
+    if type(version) is not int or version < 0:
+        raise ConfigSchemaError("schemaVersion 必须是非负整数")
+    if version > CURRENT_SCHEMA_VERSION:
+        raise FutureConfigSchemaError(
+            "配置 schemaVersion=%d 新于当前程序支持的 %d" %
+            (version, CURRENT_SCHEMA_VERSION))
+    source_version = version
+    migrated = json.loads(json.dumps(raw, ensure_ascii=False))
+    while version < CURRENT_SCHEMA_VERSION:
+        migration = CONFIG_MIGRATIONS.get(version)
+        if migration is None:
+            raise ConfigSchemaError("缺少 schemaVersion=%d 的迁移器" % version)
+        migrated = migration(migrated)
+        next_version = migrated.get("schemaVersion")
+        if next_version != version + 1:
+            raise ConfigSchemaError("配置迁移器未正确递增 schemaVersion")
+        version = next_version
+    return migrated, source_version
+
+
+class Config:
+    """配置读写：显式 schema 迁移 + 原子写 + 上一份良好备份。"""
+
+    from file_tools import DEFAULT_ES_PATH
+
+    DEFAULT = {"schemaVersion": CURRENT_SCHEMA_VERSION,
+               "apps": [], "hidden": [], "pinned": [], "promoted": [],
+               "watchedKeywords": [], "uiTheme": DEFAULT_UI_THEME,
+               "rules": DEFAULT_RULES, "presets": [], "activePreset": None,
+               "ignoredAlerts": {}, "alertOverrides": {},
+               "folders": [], "fileSearch": {"esPath": DEFAULT_ES_PATH},
+               "directorySnapshots": {}}
+    APP_DEFAULT = {"id": None, "name": "", "command": "", "cwd": None,
+                   "shell": None,
+                   "port": None, "emoji": None, "glyph": None, "icon": None,
+                   "favicon": None, "kind": "service", "lastPid": None,
+                   "lastPgid": None, "runToken": None,
+                   "attached": False, "lastExit": None, "createdAt": 0}
+    APP_DEFAULT.update(APP_FIELDS)
+
+    def __init__(self, path):
+        self._lock = threading.RLock()
+        self._path = path
+        self._writable = True
+        self._recovered_from_backup = False
+        self._migration_from = None
+        self._health_issues = []
+        self._data = self._load()
+
+    @staticmethod
+    def _payload(data):
+        return json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+
+    @classmethod
+    def _normalize(cls, raw):
+        data = {"schemaVersion": CURRENT_SCHEMA_VERSION}
+        for key, default in cls.DEFAULT.items():
+            if key == "schemaVersion":
+                continue
+            value = raw.get(key)
+            if isinstance(value, type(default)):
+                data[key] = (json.loads(json.dumps(value, ensure_ascii=False))
+                             if isinstance(value, (list, dict)) else value)
+            else:
+                data[key] = copy.deepcopy(default)
+        data['activePreset'] = raw.get('activePreset') if isinstance(raw.get('activePreset'), str) else None
+        apps = []
+        for item in data["apps"]:
+            if not isinstance(item, dict) or not item.get("id"):
+                continue
+            app = copy.deepcopy(cls.APP_DEFAULT)
+            for key in app:
+                if key in item:
+                    app[key] = item[key]
+            apps.append(app)
+        data["apps"] = apps
+        return data
+
+    def _load(self):
+        paths = (self._path, self._path + ".bak")
+        found_candidate = False
+        for index, path in enumerate(paths):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                migrated, source_version = migrate_config(raw)
+                data = self._normalize(migrated)
+                if index:
+                    self._recovered_from_backup = True
+                    LOG.warning("主配置不可读，已从备份恢复: %s", path)
+                if source_version < CURRENT_SCHEMA_VERSION:
+                    self._migration_from = source_version
+                self._persist_loaded_state(
+                    data, raw, source_index=index,
+                    source_version=source_version)
+                return data
+            except FileNotFoundError:
+                continue
+            except FutureConfigSchemaError as e:
+                # 回退到旧程序时绝不用旧 .bak 覆盖更新 schema 的主文件。
+                found_candidate = True
+                self._health_issues.append(str(e))
+                LOG.error("拒绝降级读取配置: %s", path)
+                break
+            except (OSError, UnicodeError, json.JSONDecodeError,
+                    ConfigSchemaError, TypeError, ValueError):
+                found_candidate = True
+                LOG.exception("读取配置失败: %s", path)
+        data = self._normalize(self.DEFAULT)
+        if found_candidate:
+            # 配置和备份都不可用时，展示空状态但禁止写入，
+            # 避免一次 UI 操作就把尚可人工恢复的文件覆盖。
+            self._writable = False
+            self._health_issues.append(
+                "主配置与备份均不可读，已进入只读保护状态")
+            return data
+        try:
+            self._write_atomic(self._path, self._payload(data))
+        except OSError as e:
+            self._writable = False
+            self._health_issues.append("无法创建配置文件: %s" % e)
+        return data
+
+    def _persist_loaded_state(self, data, raw, source_index, source_version):
+        """将已恢复/迁移的配置落回主文件，不破坏良好备份。"""
+        needs_migration = source_version < CURRENT_SCHEMA_VERSION
+        if not source_index and not needs_migration:
+            return
+        try:
+            if not source_index and needs_migration:
+                # 迁移前的配置是上一份良好版本。
+                self._write_atomic(self._path + ".bak", self._payload(raw))
+            # 从 .bak 恢复时只修复主文件，保留已验证的备份。
+            self._write_atomic(self._path, self._payload(data))
+        except OSError as e:
+            self._writable = False
+            self._health_issues.append("配置恢复/迁移落盘失败: %s" % e)
+            LOG.exception("配置恢复/迁移落盘失败")
+
+    def snapshot(self):
+        """返回配置的深拷贝（数据均为 JSON 可序列化）。"""
+        with self._lock:
+            return json.loads(json.dumps(self._data, ensure_ascii=False))
+
+    def health_info(self):
+        with self._lock:
+            return {
+                "writable": self._writable,
+                "recoveredFromBackup": self._recovered_from_backup,
+                "migratedFromSchema": self._migration_from,
+                "issues": list(self._health_issues),
+            }
+
+    def update(self, fn):
+        """在锁内执行 fn(self._data) 修改配置，随后原子落盘，返回 fn 的返回值。"""
+        with self._lock:
+            if not self._writable:
+                raise OSError("配置处于只读保护状态，请先恢复配置或权限")
+            previous = json.loads(json.dumps(self._data, ensure_ascii=False))
+            try:
+                result = fn(self._data)
+                payload = self._payload(self._data)
+                previous_payload = self._payload(previous)
+                if payload == previous_payload:
+                    return result
+                # 先保存上一份良好内容，再替换主文件。
+                self._write_atomic(self._path + ".bak", previous_payload)
+                self._write_atomic(self._path, payload)
+            except Exception:
+                self._data = previous
+                raise
+        # get_state_snapshot 的缓存锁内会读取配置；若这里仍持有配置锁再
+        # 获取缓存锁，两条路径会形成 cfg -> cache / cache -> cfg 的死锁。
+        # 配置已原子落盘，先释放配置锁再失效缓存，旧快照即使正在构建，
+        # 也会在完成后被本次失效立即清除。
+        invalidate_state_cache()
+        if getattr(self, 'monitor', None):
+            self.monitor.wake.set()
+        return result
+
+    @staticmethod
+    def _write_atomic(path, payload):
+        _ensure_private_dir(os.path.dirname(path) or ".")
+        tmp = path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        os.chmod(path, 0o600)
+
+
+def _lock_exclusive(lock_file):
+    """非阻塞独占锁：POSIX flock / Windows msvcrt.locking。"""
+    if fcntl is not None:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return
+    import msvcrt
+    # msvcrt.locking 需要文件里已有内容才能锁字节区间
+    if os.fstat(lock_file.fileno()).st_size == 0:
+        lock_file.write("\0")
+        lock_file.flush()
+    lock_file.seek(0)
+    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+
+
+def _unlock(lock_file):
+    if fcntl is not None:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        return
+    import msvcrt
+    try:
+        lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass
+
+
+def acquire_instance_lock(path=INSTANCE_LOCK_PATH):
+    """Acquire the per-project process lock and keep its file object alive.
+
+    Port fallback alone is not a single-instance guarantee: two servers on
+    :9600/:9601 would still update the same config.  flock ties exclusivity to
+    this data directory and is released automatically if the process crashes.
+    """
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    lock_file = os.fdopen(fd, "r+", encoding="ascii")
+    try:
+        _lock_exclusive(lock_file)
+    except OSError as e:
+        lock_file.close()
+        if e.errno in (errno.EACCES, errno.EAGAIN):
+            return None
+        raise
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(lock_file.fileno(), 0o600)
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write("%d\n" % SELF_PID)
+        lock_file.flush()
+        os.fsync(lock_file.fileno())
+    except OSError:
+        _unlock(lock_file)
+        lock_file.close()
+        raise
+    return lock_file
+
+
+def release_instance_lock(lock_file):
+    if lock_file is None:
+        return
+    try:
+        _unlock(lock_file)
+    finally:
+        lock_file.close()
+
+
+# ---------------------------------------------------------------- 子进程与解析
+
+def hidden_subprocess_kwargs():
+    """Windows 后台命令不得因父进程无控制台而反复弹出黑窗。"""
+    if not IS_WIN:
+        return {}
+    return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+
+
+def independent_windows_flags():
+    # NO_WINDOW only hides a console; BREAKAWAY separates the lifetime from
+    # a host Job's kill-on-close policy. Never retry without this flag.
+    return (getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
+            | getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0x00000200)
+            | getattr(subprocess, 'CREATE_BREAKAWAY_FROM_JOB', 0x01000000))
+
+
+def run_cmd(args, timeout=SUBPROCESS_TIMEOUT):
+    """运行命令并返回 stdout；任何异常/超时都返回空串，绝不上抛。"""
+    try:
+        r = subprocess.run(args, capture_output=True, text=True,
+                           errors="replace", timeout=timeout,
+                           **hidden_subprocess_kwargs())
+        return r.stdout or ""
+    except Exception:
+        LOG.exception("命令执行失败: %r", args)
+        return ""
+
+
+# ---------------------------------------------------------------- Windows 适配层
+# Windows 没有 ps/lsof/osascript/进程组/uid。以下函数把扫描、启停、对话框
+# 收敛成与 macOS 路径同签名的实现；上层逻辑不做平台分支。
+
+
+def _win_powershell(script, timeout=SUBPROCESS_TIMEOUT, sta=False):
+    """运行 PowerShell 并返回 stdout；失败返回空串。
+
+    显式把控制台输出编码切到 UTF-8：PowerShell 重定向输出默认用
+    系统 OEM 代码页（中文系统 GBK），与 Python 的 locale 编码不一致时
+    中文命令会乱码甚至破坏 JSON。
+    """
+    try:
+        args = ["powershell", "-NoProfile", "-NonInteractive"]
+        if sta:
+            args.append("-STA")
+        args += [
+            "-ExecutionPolicy", "Bypass", "-Command",
+            "[Console]::OutputEncoding=[Text.Encoding]::UTF8; " + script,
+        ]
+        r = subprocess.run(
+            args, capture_output=True, timeout=timeout,
+            **hidden_subprocess_kwargs())
+        if r.returncode != 0:
+            LOG.warning("PowerShell 执行失败，退出码 %s", r.returncode)
+            return ""
+        return r.stdout.decode("utf-8", errors="replace") or ""
+    except Exception:
+        LOG.exception("PowerShell 执行失败")
+        return ""
+
+
+def _win_quote(value):
+    """引用写入 CMD 批处理的路径/参数；百分号必须转义，延迟展开由锚点关闭。"""
+    return '"%s"' % str(value).replace('%', '%%').replace('"', '""')
+
+
+def app_shell(app):
+    """旧配置保留原平台解释器，不静默改变已有命令的语义。"""
+    return app.get("shell") or ("cmd" if IS_WIN else "bash")
+
+
+def _parse_win_process_table_json(text):
+    """CIM ConvertTo-Json 文本 → {pid: {ppid, args, name, exe, created, ws}}。"""
+    if not text or not text.strip():
+        return {}
+    try:
+        items = json.loads(text)
+    except ValueError:
+        return {}
+    if isinstance(items, dict):
+        items = [items]
+    if not isinstance(items, list):
+        return {}
+    table = {}
+    for item in items:
+        try:
+            pid = int(item.get("ProcessId") or 0)
+        except (TypeError, ValueError):
+            continue
+        if pid <= 0:
+            continue
+        try:
+            ppid = int(item.get("ParentProcessId") or 0)
+        except (TypeError, ValueError):
+            ppid = 0
+        table[pid] = {
+            "ppid": ppid,
+            "name": item.get("Name") or "",
+            "exe": item.get("ExecutablePath") or "",
+            "args": item.get("CommandLine") or "",
+            "created": item.get("CreationDate") or "",
+            "ws": item.get("WorkingSetSize"),
+            "cpu": item.get("CpuPercent"),
+        }
+    return table
+
+
+_WIN_PROCESS_CACHE = {"mono": 0.0, "table": None}
+_WIN_PROCESS_CACHE_LOCK = threading.Lock()
+_NATIVE_METRICS = None
+
+
+def _win_process_table(refresh=False):
+    """共享原生 API 快照 → {pid: {ppid, args, name, exe, created, ws}}。"""
+    global _NATIVE_METRICS
+    now = time.monotonic()
+    with _WIN_PROCESS_CACHE_LOCK:
+        cached = _WIN_PROCESS_CACHE["table"]
+        if (not refresh and cached is not None
+                and now - _WIN_PROCESS_CACHE["mono"] < 0.8):
+            return cached
+        if _NATIVE_METRICS is None:
+            from win_metrics import Metrics
+            _NATIVE_METRICS = Metrics()
+        table = _NATIVE_METRICS.sample()
+        _WIN_PROCESS_CACHE["mono"] = time.monotonic()
+        _WIN_PROCESS_CACHE["table"] = table
+    return table
+
+
+def _invalidate_win_process_cache():
+    if not IS_WIN:
+        return
+    with _WIN_PROCESS_CACHE_LOCK:
+        _WIN_PROCESS_CACHE["table"] = None
+
+
+_WIN_TOTAL_MEM_CACHE = {"mono": 0.0, "kb": 0.0}
+
+
+def _win_total_memory_kb():
+    """系统总物理内存（KB），10 秒缓存；失败返回 0。"""
+    now = time.monotonic()
+    if now - _WIN_TOTAL_MEM_CACHE["mono"] < 10.0:
+        return _WIN_TOTAL_MEM_CACHE["kb"]
+    if _NATIVE_METRICS is None:
+        _win_process_table()
+    kb = _NATIVE_METRICS.memory().total / 1024
+    _WIN_TOTAL_MEM_CACHE["mono"] = now
+    _WIN_TOTAL_MEM_CACHE["kb"] = kb
+    return kb
+
+
+_WIN_EPOCH = 116444736000000000  # 1601-01-01 → 1970-01-01（100ns 单位）
+
+
+def _win_parse_creation(created):
+    if isinstance(created, (int, float)):
+        return float(created)
+    """CIM CreationDate（PS 5.1 / ISO / DMTF）→ 时间戳秒。"""
+    if not created:
+        return None
+    text = str(created)
+    try:
+        # Windows PowerShell 5.1 的 ConvertTo-Json DateTime 形式。
+        serialized = re.fullmatch(r"/Date\((-?\d+)(?:[+-]\d{4})?\)/", text)
+        if serialized:
+            return int(serialized.group(1)) / 1000.0
+        if text.endswith("+000") or "T" in text:
+            from datetime import datetime
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            return parsed.timestamp()
+        m = re.fullmatch(
+            r"(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})"
+            r"(?:\.\d+)?([+-])(\d{3})", text)
+        if m:
+            from datetime import datetime, timedelta, timezone
+            offset = int(m.group(8)) * (1 if m.group(7) == "+" else -1)
+            return datetime(
+                *[int(g) for g in m.groups()[:6]],
+                tzinfo=timezone(timedelta(minutes=offset))).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return None
+
+
+def _win_etime(created):
+    created_ts = _win_parse_creation(created)
+    if created_ts is None:
+        return 0
+    return max(0, int(time.time() - created_ts))
+
+
+def _win_children_map(table):
+    """把进程快照一次转换为 ``ppid -> [pid]`` 索引。"""
+    children = {}
+    for pid, info in table.items():
+        ppid = info.get("ppid")
+        if isinstance(ppid, int) and ppid > 0:
+            parent_created = table.get(ppid, {}).get('created')
+            child_created = info.get('created')
+            if isinstance(parent_created, (int, float)) and isinstance(child_created, (int, float)) and parent_created > child_created:
+                continue
+            children.setdefault(ppid, []).append(pid)
+    return children
+
+
+def _win_tree_from_children(root_pid, children):
+    """从共享父子索引读取 root 及其全部存活后代。"""
+    result = []
+    stack = [root_pid]
+    seen = set()
+    while stack:
+        current = stack.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        if current != root_pid:
+            result.append(current)
+        stack.extend(children.get(current, []))
+    return [root_pid] + sorted(result)
+
+
+def _win_tree_of(root_pid, table):
+    """root 及其全部存活后代；单根查询兼容入口。"""
+    return _win_tree_from_children(root_pid, _win_children_map(table))
+
+
+def _win_trees_of(root_pids, table):
+    """为多个受管根 PID 建树；整张进程表只扫描一次。"""
+    children = _win_children_map(table)
+    return {
+        root_pid: _win_tree_from_children(root_pid, children)
+        for root_pid in root_pids
+    }
+
+
+def _win_cwd(pid):
+    """读取同架构进程的工作目录（PEB）；失败返回 None。
+
+    通过 NtQueryInformationProcess 取 PEB 基址，再读
+    RTL_USER_PROCESS_PARAMETERS.CurrentDirectory。只读、无副作用；
+    任何一步失败都静默返回 None。
+    """
+    if not IS_WIN:  # pragma: no cover - 仅 Windows 执行
+        return None
+    PROCESS_QUERY_INFORMATION = 0x0400
+    PROCESS_VM_READ = 0x0010
+    handle = _KERNEL32.OpenProcess(
+        PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, int(pid))
+    if not handle:
+        return None
+    try:
+        is_64 = ctypes.sizeof(ctypes.c_void_p) == 8
+        buf = ctypes.create_string_buffer(48)
+        status = _NTDLL.NtQueryInformationProcess(
+            handle, 0, buf, 48, None)
+        if status != 0:
+            return None
+        if is_64:
+            peb_addr = int.from_bytes(buf.raw[8:16], "little")
+            params_offset = 0x20
+            cwd_offset = 0x38
+        else:
+            peb_addr = int.from_bytes(buf.raw[4:8], "little")
+            params_offset = 0x10
+            cwd_offset = 0x24
+        if not peb_addr:
+            return None
+        peb = ctypes.create_string_buffer(64)
+        if not _KERNEL32.ReadProcessMemory(handle, peb_addr, peb, 64, None):
+            return None
+        params_addr = int.from_bytes(
+            peb.raw[params_offset:params_offset + 8], "little")
+        if not params_addr:
+            return None
+        params = ctypes.create_string_buffer(128)
+        if not _KERNEL32.ReadProcessMemory(
+                handle, params_addr, params, 128, None):
+            return None
+        length = int.from_bytes(params.raw[cwd_offset:cwd_offset + 2], "little")
+        if length <= 0 or length > 1024:
+            return None
+        buffer_addr = int.from_bytes(
+            params.raw[cwd_offset + 8:cwd_offset + 16], "little")
+        if not buffer_addr:
+            return None
+        raw = ctypes.create_string_buffer(length)
+        if not _KERNEL32.ReadProcessMemory(handle, buffer_addr, raw, length, None):
+            return None
+        return raw.raw.decode("utf-16-le", errors="replace").rstrip("\x00\\")
+    finally:
+        _KERNEL32.CloseHandle(handle)
+
+
+def _win_taskkill(pid, tree=True, force=False):
+    """taskkill 停止进程（树）。返回 (ok, error)。"""
+    args = ["taskkill"]
+    if tree:
+        args.append("/T")
+    if force:
+        args.append("/F")
+    args += ["/PID", str(int(pid))]
+    try:
+        r = subprocess.run(
+            args, capture_output=True, text=True, errors="replace",
+            timeout=SUBPROCESS_TIMEOUT, **hidden_subprocess_kwargs())
+    except Exception as e:
+        return False, "taskkill 失败: %s" % e
+    if r.returncode == 0:
+        _invalidate_win_process_cache()
+        return True, None
+    return False, "taskkill 失败（exit %d）" % r.returncode
+
+
+def _win_stop_process(pid, tree=True, force=False):
+    """Never silently escalate a normal stop to /F."""
+    if force:
+        return _win_taskkill(pid, tree=tree, force=True)
+    ok, error = _win_taskkill(pid, tree=tree, force=False)
+    if ok or not pid_alive(pid):
+        return True, None
+    return False, error
+
+
+def _win_command_quote_path(path):
+    """命令字符串中的路径引用（cmd /c 场景）。"""
+    return _win_quote(os.path.normpath(os.path.expanduser(str(path))))
+
+
+def parse_etime(s):
+    """ps 的 etime：[[dd-]hh:]mm:ss → 秒。异常返回 0。"""
+    try:
+        s = s.strip()
+        days = 0
+        if "-" in s:
+            d, s = s.split("-", 1)
+            days = int(d)
+        parts = [int(p) for p in s.split(":")]
+        if len(parts) == 2:
+            hours, minutes, secs = 0, parts[0], parts[1]
+        elif len(parts) == 3:
+            hours, minutes, secs = parts
+        else:
+            return 0
+        return days * 86400 + hours * 3600 + minutes * 60 + secs
+    except Exception:
+        return 0
+
+
+def _to_float(tok, default=0.0):
+    try:
+        return float(tok)
+    except (TypeError, ValueError):
+        return default
+
+
+def scan_listeners():
+    """监听快照 → {(pid, port): {bind_host, ...}}。
+
+    字典仍可像旧集合一样迭代/判断 ``(pid, port)``，同时保留监听地址，
+    供前端区分仅监听 ``::1`` 的服务（需通过 localhost 打开）。
+    """
+    if IS_WIN:
+        return _scan_listeners_windows()
+    out = run_cmd(["lsof", "-iTCP", "-sTCP:LISTEN", "-P", "-n"])
+    found = {}
+    for line in out.splitlines():
+        if not line or line.startswith("COMMAND"):
+            continue
+        parts = line.split()
+        if len(parts) < 9:
+            continue
+        try:
+            pid = int(parts[1])
+        except ValueError:
+            continue
+        # NAME 列形如 *:8791 / 127.0.0.1:8080 / [::1]:8765，末尾可能跟 "(LISTEN)"
+        port = None
+        bind_host = None
+        for tok in reversed(parts):
+            m = re.search(r":(\d+)$", tok)
+            if m:
+                port = int(m.group(1))
+                bind_host = tok[:m.start()]
+                if bind_host.startswith("[") and bind_host.endswith("]"):
+                    bind_host = bind_host[1:-1]
+                break
+        if port is None:
+            continue
+        found.setdefault((pid, port), set()).add(bind_host or "")
+    return found
+
+
+def _parse_netstat_output(text):
+    """netstat 回退解析；用远端端口 0 识别监听，避免依赖本地化状态名。"""
+    found = {}
+    for line in text.splitlines():
+        toks = line.split()
+        if len(toks) < 5 or toks[0].upper() != "TCP":
+            continue
+        remote = toks[2]
+        _, remote_sep, remote_port = remote.rpartition(":")
+        if not remote_sep or remote_port != "0":
+            continue
+        state = " ".join(toks[3:-1]).upper().replace("-", "_")
+        if any(name in state for name in (
+                "ESTABLISHED", "SYN_SENT", "SYN_RECEIVED", "FIN_WAIT",
+                "TIME_WAIT", "CLOSE_WAIT", "LAST_ACK", "CLOSING",
+                "CLOSED", "DELETE_TCB")):
+            continue
+        local = toks[1]
+        try:
+            pid = int(toks[-1])
+        except ValueError:
+            continue
+        # 本地地址形如 127.0.0.1:8080 / [::1]:8765 / 0.0.0.0:9600
+        host, sep, port_text = local.rpartition(":")
+        if not sep:
+            continue
+        try:
+            port = int(port_text)
+        except ValueError:
+            continue
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+        found.setdefault((pid, port), set()).add(host or "")
+    return found
+
+
+def _scan_listeners_windows():
+    from win_metrics import listeners
+    return listeners()
+
+
+def listener_open_host(listeners, port, pids=None):
+    """返回浏览器访问监听端口时应使用的本地主机名。
+
+    macOS 上有些开发服务器只绑定 IPv6 回环 ``::1``；这时
+    ``127.0.0.1`` 会直接拒绝连接，而 ``localhost`` 能正确解析到它。
+    对旧测试/旧调用传入的 set 快照则保持原来的 IPv4 默认值。
+    """
+    if not isinstance(listeners, dict):
+        return "127.0.0.1"
+    allowed_pids = set(pids) if pids is not None else None
+    hosts = set()
+    for (pid, listening_port), values in listeners.items():
+        if listening_port != port or (
+                allowed_pids is not None and pid not in allowed_pids):
+            continue
+        if isinstance(values, str):
+            hosts.add(values)
+        elif isinstance(values, (set, list, tuple)):
+            hosts.update(value for value in values if isinstance(value, str))
+    normalized = {host.strip("[]").casefold() for host in hosts if host}
+    ipv4_capable = any(
+        host in ("*", "0.0.0.0") or host.startswith("127.")
+        for host in normalized)
+    ipv6_loopback_only = bool(normalized) and not ipv4_capable and all(
+        host in ("::", "::1", "localhost") for host in normalized)
+    return "localhost" if ipv6_loopback_only else "127.0.0.1"
+
+
+def ps_snapshot(pids=None, with_uid=True):
+    """批量进程信息 → {pid: {"uid","comm","args","cpu","mem","etime"}}。
+
+    pids=None 表示全部进程。macOS 走 ps 两趟解析；Windows 走 CIM 一趟。
+    """
+    if IS_WIN:
+        return _ps_snapshot_windows(pids)
+    base = ["ps"]
+    if pids is None:
+        base.append("-ax")
+    else:
+        pids = [int(p) for p in pids]
+        if not pids:
+            return {}
+        base += ["-p", ",".join(str(p) for p in pids)]
+    # comm 必须放在最后一列：macOS ps 只保证最后一列不被定宽截断
+    # （comm 在中间列时会被压成约 16 字节，长路径被砍断）。
+    fields = ["pid"] + (["uid"] if with_uid else []) + \
+             ["etime", "%cpu", "%mem", "comm"]
+    out1 = run_cmd(base + ["-o", ",".join(fields)])
+    out2 = run_cmd(base + ["-o", "pid,args"])
+
+    snap = {}
+    fixed = 5 if with_uid else 4  # pid [uid] etime cpu mem 之后的都是 comm
+    for line in out1.splitlines():
+        toks = line.split()
+        if len(toks) < fixed + 1:
+            continue
+        try:
+            pid = int(toks[0])
+        except ValueError:
+            continue  # 表头行
+        i = 1
+        entry = {"args": ""}
+        if with_uid:
+            try:
+                entry["uid"] = int(toks[1])
+            except ValueError:
+                entry["uid"] = -1
+            i = 2
+        entry["etime"] = parse_etime(toks[i])
+        entry["cpu"] = _to_float(toks[i + 1])
+        entry["mem"] = _to_float(toks[i + 2])
+        entry["comm"] = " ".join(toks[i + 3:])
+        snap[pid] = entry
+    for line in out2.splitlines():
+        toks = line.split(None, 1)
+        if not toks:
+            continue
+        try:
+            pid = int(toks[0])
+        except ValueError:
+            continue
+        if pid in snap:
+            snap[pid]["args"] = toks[1] if len(toks) > 1 else ""
+    for line in run_cmd(base + ["-o", "pid=,lstart="]).splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and parts[0].isdigit() and int(parts[0]) in snap:
+            snap[int(parts[0])]['identity'] = ' '.join(parts[1].split())
+    return snap
+
+
+def _ps_snapshot_windows(pids=None):
+    """CIM 快照 → 与 ps_snapshot 相同结构。
+
+    CPU 使用 CIM 格式化性能计数器，mem 用 WorkingSet 占比；所有者使用
+    访问令牌 SID 指纹，跨用户或不可读取的进程不会被误当作当前用户。
+    """
+    table = _win_process_table()
+    if not table:
+        return {}
+    total_kb = _win_total_memory_kb()
+    result = {}
+    for pid, info in table.items():
+        if pids is not None and pid not in pids:
+            continue
+        ws = info.get("ws")
+        try:
+            ws_bytes = float(ws or 0)
+        except (TypeError, ValueError):
+            ws_bytes = 0.0
+        mem = (ws_bytes / 1024.0 / total_kb * 100.0) if total_kb else 0.0
+        try:
+            cpu = float(info.get("cpu") or 0)
+        except (TypeError, ValueError):
+            cpu = 0.0
+        owner_uid = _win_owner_uid(pid)
+        result[pid] = {
+            "uid": owner_uid if owner_uid is not None else -1,
+            "comm": info.get("exe") or info.get("name") or "",
+            "args": info.get("args") or "",
+            "cpu": round(max(0.0, cpu), 2),
+            "mem": round(mem, 2),
+            "etime": _win_etime(info.get("created")),
+            "memoryBytes": ws_bytes if ws is not None else None,
+            "identity": info.get('identity'), "exe": info.get('exe'),
+            "ioWriteBytes": info.get('ioWriteBytes'),
+        }
+    return result
+
+
+def lsof_cwds(pids):
+    """lsof -a -p <pids> -d cwd -Fn → {pid: cwd}。Windows 走 PEB 读取。"""
+    pids = [int(p) for p in pids]
+    if not pids:
+        return {}
+    if IS_WIN:
+        result = {}
+        for pid in pids:
+            cwd = _win_cwd(pid)
+            if cwd:
+                result[pid] = cwd
+        return result
+    out = run_cmd(["lsof", "-a", "-p", ",".join(str(p) for p in pids),
+                   "-d", "cwd", "-Fn"])
+    result = {}
+    cur = None
+    for line in out.splitlines():
+        if line.startswith("p"):
+            try:
+                cur = int(line[1:])
+            except ValueError:
+                cur = None
+        elif line.startswith("n") and cur is not None:
+            result[cur] = line[1:]
+    return result
+
+
+def _win_pid_alive(pid):
+    """进程存活检查：OpenProcess + GetExitCodeProcess。
+
+    Windows 上 os.kill(pid, 0) 对已退出进程仍会成功返回（CPython 实现
+    用 TerminateProcess/GetExitCodeProcess，对死进程句柄不报错）；而
+    OpenProcess 单独用也不可靠——监控/杀软可能持有已退出进程的句柄，
+    让进程对象残留。因此必须同时校验退出码不是 STILL_ACTIVE(259)。
+    """
+    h = _KERNEL32.OpenProcess(0x1000, False, int(pid))
+    # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return False
+    try:
+        code = wintypes.DWORD()
+        if not _KERNEL32.GetExitCodeProcess(h, ctypes.byref(code)):
+            return False
+        return code.value == 259  # STILL_ACTIVE
+    finally:
+        _KERNEL32.CloseHandle(h)
+
+
+def pid_alive(pid):
+    if IS_WIN:
+        return _win_pid_alive(pid)
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except PermissionError:
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+# ---------------------------------------------------------------- 状态构建
+
+SYSTEM_PATH_PREFIXES = ("/usr/libexec/", "/usr/sbin/", "/sbin/", "/System/", "/usr/lib/")
+WIN_SYSTEM_DIR = (os.environ.get("WINDIR") or r"C:\Windows").rstrip("\\") + "\\"
+
+# 开发服务关键词：命中 name/args 时优先归为 "mine"（覆盖 .app 规则，
+# 例如 ollama 守护进程在 Ollama.app 内、Docker 在 Docker.app 内）
+DEV_KEYWORDS = (
+    "python", "node", "ruby", "php", "nginx", "caddy", "postgres",
+    "mysql", "redis", "mongo", "ollama", "docker", "deno", "bun",
+    "uvicorn", "gunicorn", "hugo", "vite", "streamlit", "jupyter",
+    "ngrok", "frp", "code-server", "java",
+)
+
+
+def classify_group(key, name, comm, args, cwd, promoted, app=None):
+    if key in promoted:
+        return "mine"
+    text = name.lower()
+    if IS_WIN:
+        if app:
+            return 'mine' if (app.get('kind') or 'service') == 'service' else 'background'
+        if comm.lower().startswith(WIN_SYSTEM_DIR.lower()):
+            return 'background'
+        # Exact executable names avoid treating ordinary app/helper names as
+        # developer services merely because they contain e.g. "node" or "java".
+        executable = text.removesuffix('.exe')
+        runtimes = DEV_KEYWORDS + ('pythonw', 'python3', 'javaw', 'mysqld', 'mongod',
+                                   'mongos', 'redis-server', 'php-cgi', 'frpc', 'frps')
+        return 'mine' if executable in runtimes or re.fullmatch(r'pythonw?\d+(?:\.\d+)*', executable) else 'background'
+    if any(k in text for k in DEV_KEYWORDS):
+        return "mine"
+    if ".app/Contents/" in comm or ".app/Contents/" in args:
+        return "background"
+    if comm.startswith(SYSTEM_PATH_PREFIXES):
+        return "background"
+    if "/Library/Containers/" in comm or "/Library/Containers/" in (cwd or ""):
+        return "background"
+    return "mine"
+
+
+HOME_DIR = os.path.expanduser("~")
+
+
+def project_name(cwd):
+    """从工作目录推断项目名（最后一段目录名），无有效 cwd 时返回 None。"""
+    if not cwd:
+        return None
+    cwd = cwd.rstrip("/\\")
+    if not cwd or cwd == os.path.abspath(os.sep) or cwd == HOME_DIR:
+        return None
+    return os.path.basename(cwd) or None
+
+
+# ---------------------------------------------------------------- 进程溯源
+# 沿 PPID 链向上识别「是谁启动了这个服务」：AI 编程助手、编辑器、终端、
+# 总控台自身或 launchd。结果只是展示用的尽力判断，不影响任何启停逻辑。
+
+# 向上爬时要跳过的包装层（按 argv[0] 基名匹配）：壳、包管理器与任务执行器
+_ORIGIN_SKIP_NAMES = {
+    "zsh", "bash", "sh", "dash", "fish", "login", "su", "sudo", "env",
+    "command", "xargs", "nohup", "setsid", "script", "expect", "caffeinate",
+    "launchd",
+    "npm", "npx", "pnpm", "yarn", "corepack", "make", "just",
+    "node", "tsx", "nodemon", "deno", "bun", "bunx",
+    "python", "python3", "uv", "poetry", "pip", "pipx",
+    "ruby", "php", "java", "dotnet", "go", "cargo",
+}
+
+# 已知 AI 编程助手签名（在祖先 args 中做词边界匹配，按顺序取先命中者）
+_ORIGIN_AGENT_PATTERNS = (
+    (re.compile(r"\bcodex\b", re.I), "Codex"),
+    (re.compile(r"claude-code|\bclaude\b", re.I), "Claude Code"),
+    (re.compile(r"\bkimi\b", re.I), "Kimi"),
+    (re.compile(r"\bgemini\b", re.I), "Gemini"),
+    (re.compile(r"\baider\b", re.I), "Aider"),
+    (re.compile(r"\bopencode\b", re.I), "OpenCode"),
+    (re.compile(r"\bgoose\b", re.I), "Goose"),
+    (re.compile(r"\bcursor-agent\b", re.I), "Cursor"),
+    (re.compile(r"\bcopilot\b", re.I), "Copilot"),
+    (re.compile(r"\bqwen\b", re.I), "Qwen"),
+    (re.compile(r"\bqoder\b", re.I), "Qoder"),
+    (re.compile(r"\bamp\b", re.I), "Amp"),
+    (re.compile(r"\bcodebuddy\b", re.I), "CodeBuddy"),
+)
+
+# .app 包名 → (展示名, 图标)。未列出的包按原名 + package 图标展示
+_ORIGIN_APP_ALIASES = {
+    "visual studio code": ("VS Code", "code"),
+    "visual studio code - insiders": ("VS Code", "code"),
+    "cursor": ("Cursor", "code"),
+    "trae": ("Trae", "code"),
+    "windsurf": ("Windsurf", "code"),
+    "zed": ("Zed", "code"),
+    "sublime text": ("Sublime", "code"),
+    "webstorm": ("WebStorm", "code"),
+    "intellij idea": ("IDEA", "code"),
+    "goland": ("GoLand", "code"),
+    "pycharm": ("PyCharm", "code"),
+    "nova": ("Nova", "code"),
+    "xcode": ("Xcode", "code"),
+    "iterm2": ("iTerm", "terminal"),
+    "iterm": ("iTerm", "terminal"),
+    "terminal": ("终端", "terminal"),
+    "warp": ("Warp", "terminal"),
+    "kitty": ("kitty", "terminal"),
+    "alacritty": ("Alacritty", "terminal"),
+    "wezterm": ("WezTerm", "terminal"),
+    "docker": ("Docker", "package"),
+    "ollama": ("Ollama", "package"),
+    "obsidian": ("Obsidian", "package"),
+}
+_ORIGIN_BUNDLE_RE = re.compile(r"/([^/]+)\.app/Contents/MacOS/", re.I)
+
+# 终端复用器（直接以 comm 命名，不进跳过表）
+_ORIGIN_MULTIPLEXERS = {"tmux": "tmux", "screen": "screen"}
+
+
+def origin_snapshot():
+    """ps -axo pid=,ppid=,args → {pid: (ppid, args)}，供来源溯源。"""
+    if IS_WIN:
+        table = {}
+        for pid, info in _win_process_table().items():
+            ppid = info.get("ppid")
+            if not isinstance(ppid, int) or ppid <= 0:
+                ppid = 0
+            table[pid] = (ppid, info.get("args") or "")
+        return table
+    table = {}
+    for line in run_cmd(["ps", "-axo", "pid=,ppid=,args"]).splitlines():
+        toks = line.split(None, 2)
+        if len(toks) < 2:
+            continue
+        try:
+            pid, ppid = int(toks[0]), int(toks[1])
+        except ValueError:
+            continue
+        table[pid] = (ppid, toks[2] if len(toks) > 2 else "")
+    return table
+
+
+def attribute_origin(pid, table):
+    """沿 PPID 链识别来源应用，返回 {"label", "icon"} 或 None。
+
+    祖先 args 中带有总控台 run-token 前缀（console-run:）即判定为
+    「总控台启动」——本机任一总控台实例的受管进程组都持有该标记。
+    未识别的中间层先记为候选并继续上爬；AI 助手 / 编辑器 / 终端 /
+    总控台 / launchd 是更优答案，都没有时才以最近的未识别进程命名。
+    最多上爬 12 层，遇到环或缺失即终止。
+    """
+    cur, seen, candidate = pid, set(), None
+    for _ in range(12):
+        entry = table.get(cur)
+        if not entry:
+            break
+        ppid, _ = entry
+        if ppid in seen:
+            break
+        seen.add(ppid)
+        parent_args = (table.get(ppid) or (0, ""))[1] or ""
+        if ppid <= 1:
+            return candidate or {"label": "系统", "icon": "server"}
+        if RUN_TOKEN_ARG_PREFIX in parent_args:
+            return {"label": "总控台", "icon": "rocket"}
+        hay = parent_args.casefold()
+        for pattern, label in _ORIGIN_AGENT_PATTERNS:
+            if pattern.search(hay):
+                return {"label": label, "icon": "bot"}
+        bundle = _ORIGIN_BUNDLE_RE.search(parent_args)
+        if bundle:
+            app_name = bundle.group(1)
+            label, icon = _ORIGIN_APP_ALIASES.get(
+                app_name.casefold(), (app_name, "package"))
+            return {"label": label, "icon": icon}
+        base = os.path.basename(
+            parent_args.split()[0]).lstrip("-") if parent_args.split() else ""
+        if base in _ORIGIN_MULTIPLEXERS:
+            return {"label": _ORIGIN_MULTIPLEXERS[base], "icon": "terminal"}
+        if base and base not in _ORIGIN_SKIP_NAMES and candidate is None:
+            candidate = {"label": base, "icon": "package"}
+        cur = ppid
+    return candidate
+
+
+def build_services(cfg, groups=None):
+    """返回 (services, listeners)。只含当前用户进程，排除控制台自身。"""
+    listeners = scan_listeners()
+    snap = ps_snapshot({pid for pid, _ in listeners}, with_uid=True)
+    mine_pids = [pid for pid, _ in listeners
+                 if pid != SELF_PID and pid in snap
+                 and snap[pid].get("uid") == SELF_UID]
+    cwds = lsof_cwds(mine_pids)
+    origin_table = origin_snapshot()
+
+    hidden = set(cfg.get("hidden") or [])
+    pinned = set(cfg.get("pinned") or [])
+    promoted = set(cfg.get("promoted") or [])
+    # “配置了相同端口”不代表“拥有当前监听进程”。只有 run token / 进程组
+    # 校验通过（或严格命中旧版身份）的进程才关联启动台卡片。
+    app_by_pid = listener_app_owners(
+        cfg.get("apps") or [], listeners, snap, cwds, groups)
+
+    services = []
+    for pid, port in sorted(listeners, key=lambda x: (x[1], x[0])):
+        if pid == SELF_PID:
+            continue
+        info = snap.get(pid)
+        if not info or info.get("uid") != SELF_UID:
+            continue
+        comm = info.get("comm") or ""
+        args = info.get("args") or comm
+        name = os.path.basename(comm) if comm else "?"
+        key = "%s:%d" % (name, port)
+        cwd = cwds.get(pid)
+        cwd_exists = bool(cwd and os.path.isdir(cwd))
+        if not cwd:
+            attach_issue = "无法读取进程工作目录，可能是提权或受保护进程"
+        elif not cwd_exists:
+            attach_issue = "进程工作目录已不存在：%s" % cwd
+        else:
+            attach_issue = None
+        app = app_by_pid.get(pid)
+        services.append({
+            "key": key,
+            # key 保持 name:port 以兼容既有隐藏/置顶配置；instanceKey 用于
+            # 区分同名同端口在不同时间出现的新进程，以及极少数共享监听。
+            "instanceKey": "%d:%d" % (pid, port),
+            "pid": pid, "name": name, "port": port,
+            "created": info.get('identity'),
+            "openHost": listener_open_host(listeners, port, {pid}),
+            "cwd": cwd, "project": project_name(cwd), "cmd": args,
+            "cwdExists": cwd_exists, "attachable": cwd_exists,
+            "attachIssue": attach_issue,
+            "cpu": info["cpu"], "mem": info["mem"], "uptimeSec": info["etime"],
+            "group": classify_group(key, name, comm, args, cwd, promoted, app),
+            "pinned": key in pinned, "hidden": key in hidden,
+            "promoted": key in promoted,
+            "appId": app["id"] if app else None,
+            "appName": app["name"] if app else None,
+            # 来源溯源（尽力判断）：哪个应用/AI 助手启动了这个进程
+            "origin": attribute_origin(pid, origin_table),
+        })
+    return services, listeners
+
+
+def build_watched(keywords):
+    """关注进程：每个 PID 只返回一次，并合并它命中的全部关键字。"""
+    normalized = []
+    seen_keywords = set()
+    for keyword in (keywords or []):
+        if not isinstance(keyword, str) or not keyword.strip():
+            continue
+        keyword = keyword.strip()
+        lowered = keyword.casefold()
+        if lowered in seen_keywords:
+            continue
+        seen_keywords.add(lowered)
+        normalized.append((keyword, lowered))
+    if not normalized:
+        return []
+    snap = ps_snapshot(None, with_uid=True)
+    result = []
+    for pid, info in sorted(snap.items()):
+        if pid == SELF_PID or info.get("uid") != SELF_UID:
+            continue
+        name = os.path.basename(info.get("comm") or "") or "?"
+        if name in ("ps", "lsof"):
+            continue
+        args = info.get("args") or ""
+        args_lower = args.casefold()
+        matched = [keyword for keyword, lowered in normalized
+                   if lowered in args_lower]
+        if not matched:
+            continue
+        result.append({"pid": pid, "created": info.get('identity'), "name": name, "cmd": args,
+                       "cpu": info["cpu"], "mem": info["mem"],
+                       "uptimeSec": info["etime"],
+                       # keyword 保留给旧前端，keywords 提供无损结构化数据。
+                       "keyword": "、".join(matched), "keywords": matched})
+    return result
+
+
+def pgid_members_map(root_pids=None):
+    """ps -axo pid=,pgid= → {pgid: [pid, ...]}。
+    进程退出后其子孙仍保留原 pgid（被 launchd 收养也不变），
+    因此按 pgid 能找到「脚本把服务放后台后自己退出」的存活成员。
+    Windows 无 pgid：以「锚点 PID + PPID 后代」等价建模——子进程在父进程
+    退出后同样保留原 PPID，语义与 macOS 的孤儿进程组一致。
+    """
+    if IS_WIN:
+        table = _win_process_table()
+        roots = (set(int(pid) for pid in root_pids)
+                 if root_pids is not None else set(table))
+        return _win_trees_of(roots, table)
+    groups = {}
+    for line in run_cmd(["ps", "-axo", "pid=,pgid="]).splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            pid, pgid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        groups.setdefault(pgid, []).append(pid)
+    return groups
+
+
+def _managed_candidates(app, groups):
+    token = app.get("runToken")
+    pgid = app.get("lastPgid") or app.get("lastPid")
+    if not isinstance(token, str) or not token or not isinstance(pgid, int) or pgid <= 0:
+        return set()
+    return set(groups.get(pgid, []))
+
+
+_PROCESS_CONFIG = None
+
+
+def card_process_members(app, members, apps=None):
+    """A registered child application is a boundary, not part of its launcher."""
+    if not IS_WIN or not members:
+        return list(members)
+    if apps is None:
+        apps = _PROCESS_CONFIG.snapshot()['apps'] if _PROCESS_CONFIG is not None else []
+    if not apps:
+        return list(members)
+    from ops_entries import instance_candidates, same_window_executable
+    table = _win_process_table()
+    own_root = (app.get('externalIdentity') or {}).get('pid') or app.get('lastPgid') or app.get('lastPid')
+    descendants = set(members) - {own_root}
+    if not descendants:
+        return list(members)
+    excluded = set()
+    for other in apps:
+        if other.get('id') == app.get('id'):
+            continue
+        identity = other.get('externalIdentity') or {}
+        root = identity.get('pid')
+        row = table.get(root, {})
+        roots = []
+        if (root in descendants and row.get('identity') == identity.get('created')
+                and row.get('exe') and os.path.normcase(row['exe']) == os.path.normcase(identity.get('exe', ''))
+                and process_uid(root) == SELF_UID):
+            roots = [root]
+        elif other.get('runToken'):
+            root = other.get('lastPgid') or other.get('lastPid')
+            if root in descendants:
+                raw, _, _ = managed_process_index([other], partition=False)
+                if raw.get(other.get('id')):
+                    roots = [root]
+        if not roots and other.get('instanceMatch'):
+            rule = other['instanceMatch']
+            possible = descendants
+            if rule.get('exe'):
+                possible = {pid for pid in descendants if (
+                    same_window_executable(table.get(pid, {}).get('exe'), rule['exe']) if rule.get('windowClass')
+                    else os.path.normcase(table.get(pid, {}).get('exe') or '') == os.path.normcase(rule['exe']))}
+            elif rule.get('service'):
+                runtime = rule['service'].get('runtime')
+                possible = {pid for pid in descendants if (
+                    os.path.basename(table.get(pid, {}).get('exe') or '').lower().startswith('python')
+                    if runtime == 'python' else os.path.basename(table.get(pid, {}).get('exe') or '').lower() == str(runtime) + '.exe')}
+            if possible:
+                roots = instance_candidates(sys.modules[__name__], rule, within=possible)
+        for root in roots:
+            excluded.update(_win_tree_of(root, table))
+    return [pid for pid in members if pid not in excluded]
+
+
+def managed_process_index(apps, groups=None, partition=True):
+    """批量校验应用的受控进程，返回 (appId -> [pid], ps, groups)。
+
+    必须同时满足：属于记录的进程组、属于当前用户、argv 中带本次启动的
+    随机 token。即使 PID/PGID 被系统复用，也不会把无关进程当成应用或停止它。
+    """
+    if groups is None:
+        roots = {
+            app.get("lastPgid") or app.get("lastPid")
+            for app in apps
+            if app.get("runToken")
+            and isinstance(app.get("lastPgid") or app.get("lastPid"), int)
+        }
+        groups = pgid_members_map(roots) if roots else {}
+    candidates = {}
+    all_pids = set()
+    for app in apps:
+        pids = _managed_candidates(app, groups)
+        candidates[app.get("id")] = pids
+        all_pids.update(pids)
+    snap = ps_snapshot(all_pids, with_uid=True) if all_pids else {}
+    result = {}
+    for app in apps:
+        token = app.get("runToken")
+        marker = RUN_TOKEN_ARG_PREFIX + token if token else None
+        current_user = sorted(
+            pid for pid in candidates.get(app.get("id"), set())
+            if snap.get(pid, {}).get("uid") == SELF_UID)
+        controller_found = bool(marker and any(
+            marker in snap.get(pid, {}).get("args", "") for pid in current_user))
+        # 随机标记在进程组的常驻外层 shell 上；校验后整组均为受控后代。
+        members = current_user if controller_found else []
+        result[app.get("id")] = card_process_members(app, members) if partition else members
+    return result, snap, groups
+
+
+def managed_pids(app, groups=None):
+    index, _, _ = managed_process_index([app], groups)
+    return index.get(app.get("id"), []) or external_pids(app)
+
+
+def external_pids(app):
+    identity = app.get('externalIdentity')
+    if not IS_WIN or not isinstance(identity, dict):
+        return []
+    table = _win_process_table()
+    pid = identity.get('pid')
+    row = table.get(pid, {})
+    if (row.get('identity') != identity.get('created') or not row.get('exe')
+            or os.path.normcase(row['exe']) != os.path.normcase(identity.get('exe', ''))
+            or process_uid(pid) != SELF_UID):
+        return []
+    root_created = row['created']
+    members = [p for p in _win_tree_of(pid, table)
+               if table.get(p, {}).get('created', 0) >= root_created and process_uid(p) == SELF_UID]
+    return card_process_members(app, members)
+
+
+def legacy_managed_pid(app, listeners=None, snap=None, cwds=None):
+    """识别升级前身份或用户明确认领的外部监听进程。
+
+    普通旧数据仍只接受原 lastPid。明确 ``attached`` 的卡片允许监听子进程
+    换 PID，但仍必须在配置端口上按当前 UID + 真实 cwd 唯一命中；因此
+    Next/Vite 等重建子进程后不会丢失关联，也不会只凭端口误认其他项目。
+    """
+    if app.get("runToken") or app.get('externalIdentity'):
+        return None
+    recorded_pid = app.get("lastPid")
+    port = app.get("port")
+    expected_cwd = app.get("cwd")
+    if (not isinstance(port, int) or port <= 0
+            or not isinstance(expected_cwd, str) or not expected_cwd):
+        return None
+    if listeners is None:
+        listeners = scan_listeners()
+    port_pids = {pid for pid, listening_port in listeners
+                 if listening_port == port}
+    if not app.get("attached"):
+        if not isinstance(recorded_pid, int) or recorded_pid <= 0:
+            return None
+        port_pids.intersection_update({recorded_pid})
+    if not port_pids:
+        return None
+    if snap is None:
+        snap = ps_snapshot(port_pids, with_uid=True)
+    if cwds is None:
+        cwds = lsof_cwds(port_pids)
+    matches = []
+    for pid in sorted(port_pids):
+        if snap.get(pid, {}).get("uid") != SELF_UID:
+            continue
+        actual_cwd = cwds.get(pid)
+        if not actual_cwd:
+            continue
+        try:
+            same_cwd = (
+                os.path.realpath(actual_cwd) == os.path.realpath(expected_cwd))
+        except OSError:
+            same_cwd = False
+        if same_cwd:
+            matches.append(pid)
+    if recorded_pid in matches:
+        return recorded_pid
+    return matches[0] if app.get("attached") and len(matches) == 1 else None
+
+
+def listener_app_owners(apps, listeners, snap, cwds, groups=None):
+    """返回真实受管监听进程的 ``pid -> app`` 映射。
+
+    端口只是配置与网络资源，不能作为进程所有权证明。映射沿用应用状态的
+    run token / PGID / UID 校验，并为升级前的进程保留严格 legacy 识别。
+    如果异常配置让同一 PID 同时命中多张卡片，则不做关联，避免误导 UI。
+    """
+    managed, _, _ = managed_process_index(apps, groups)
+    candidates = {}
+    for app in apps:
+        live = managed.get(app.get("id"), []) or external_pids(app)
+        if not live:
+            legacy_pid = legacy_managed_pid(app, listeners, snap, cwds)
+            live = [legacy_pid] if legacy_pid else []
+        for pid in live:
+            candidates.setdefault(pid, []).append(app)
+    return {
+        pid: owners[0]
+        for pid, owners in candidates.items()
+        if len(owners) == 1
+    }
+
+
+def desktop_background_only(app, members=None, visible=None):
+    """Browser/Codex background workers are not an open desktop interface."""
+    if not IS_WIN or app.get('kind') != 'desktop':
+        return False
+    tokens = _simple_command_tokens(app.get('command') or '')
+    candidates = ([tokens[0]] if tokens else []) + [
+        (app.get('externalIdentity') or {}).get('exe'),
+        (app.get('windowBinding') or {}).get('exe'),
+        (app.get('instanceMatch') or {}).get('exe')]
+    exe = next((path for path in candidates if path and (
+        os.path.basename(path).lower() in ('chrome.exe', 'msedge.exe') or
+        (os.path.basename(path).lower() == 'chatgpt.exe' and 'openai.codex_' in path.lower()))), None)
+    if not exe:
+        return False
+    members = managed_pids(app) if members is None else members
+    if not members:
+        return False
+    from ops_entries import browser_card_rule, list_windows, ordinary_browser_window
+    if browser_card_rule(sys.modules[__name__], app):
+        return not any(w['pid'] in members and ordinary_browser_window(w)
+                       for w in list_windows(sys.modules[__name__]))
+    if visible is None:
+        from win_metrics import windows
+        visible = windows()
+    table = _win_process_table()
+    from ops_entries import same_window_executable
+    return not any(pid in visible and same_window_executable(table.get(pid, {}).get('exe'), exe)
+                   for pid in members)
+
+
+def build_apps(cfg, listeners, groups=None):
+    """token 校验通过或严格命中旧版身份的进程才算 running。
+
+    多张卡片可共享配置端口；只有当前真实监听者不属于本卡片时才返回
+    “端口被其他进程占用”，不再把任意监听者误当成应用本身。
+    """
+    port_map = {}
+    for pid, port in listeners:
+        port_map.setdefault(port, []).append(pid)
+    apps_cfg = cfg.get("apps") or []
+    managed, snap, _ = managed_process_index(apps_cfg, groups)
+    listen_by_pid = {}
+    for pid, port in listeners:
+        listen_by_pid.setdefault(pid, []).append(port)
+    configured_ports = {
+        app["port"] for app in apps_cfg if app.get("port")}
+
+    # 端口诊断需要展示占用者的真实身份，一次批量取详情，避免逐卡 ps。
+    configured_listener_pids = {
+        pid for port in configured_ports for pid in port_map.get(port, [])}
+    listener_snap = (ps_snapshot(configured_listener_pids, with_uid=True)
+                     if configured_listener_pids else {})
+    listener_cwds = lsof_cwds(configured_listener_pids)
+    verified_owner = listener_app_owners(
+        apps_cfg, listeners, listener_snap, listener_cwds)
+
+    apps = []
+    visible = None
+    if IS_WIN:
+        from win_metrics import windows
+        visible = windows()
+    for app in apps_cfg:
+        managed_live = managed.get(app["id"], []) or external_pids(app)
+        legacy_pid = None if managed_live else legacy_managed_pid(
+            app, listeners, listener_snap, listener_cwds)
+        if (legacy_pid and
+                (verified_owner.get(legacy_pid) or {}).get("id") != app.get("id")):
+            legacy_pid = None
+        live = managed_live or ([legacy_pid] if legacy_pid else [])
+        lp = app.get("lastPid")
+        pid = lp if lp in live else (live[0] if live else None)
+        port = app.get("port")
+        configured_listeners = port_map.get(port, []) if port else []
+        listening = bool(port and any(p in live for p in configured_listeners))
+        occupied = bool(port and configured_listeners and not listening)
+        owner_pid = configured_listeners[0] if occupied else None
+        owner_info = listener_snap.get(owner_pid, {}) if owner_pid else {}
+        owner_app = verified_owner.get(owner_pid)
+        owner_cwd = listener_cwds.get(owner_pid) if owner_pid else None
+        port_owner = None
+        if owner_pid:
+            comm = owner_info.get("comm") or ""
+            port_owner = {
+                "pid": owner_pid,
+                "created": owner_info.get('identity'),
+                "openHost": listener_open_host(
+                    listeners, port, {owner_pid}),
+                "name": os.path.basename(comm) or "?",
+                "cmd": owner_info.get("args") or comm,
+                "cwd": owner_cwd,
+                "project": project_name(owner_cwd),
+                "uid": owner_info.get("uid"),
+                "currentUser": owner_info.get("uid") == SELF_UID,
+                "uptimeSec": owner_info.get("etime"),
+                "appId": owner_app.get("id") if owner_app else None,
+                "appName": owner_app.get("name") if owner_app else None,
+            }
+        actual_ports = sorted({p for member in live
+                               for p in listen_by_pid.get(member, [])})
+        open_hosts = {
+            str(actual_port): listener_open_host(
+                listeners, actual_port, set(live))
+            for actual_port in actual_ports
+        }
+        try:
+            health = inspect_app_health(app)
+        except Exception as exc:
+            LOG.warning("检查应用配置失败（%s）：%s", app.get("id"), exc)
+            health = {"status": "unknown", "blocking": False, "issues": []}
+        apps.append({
+            **{key: copy.deepcopy(app.get(key, default)) for key, default in APP_FIELDS.items()},
+            "id": app["id"], "name": app["name"], "command": app["command"],
+            "shell": app_shell(app),
+            "cwd": app.get("cwd"), "port": port,
+            "emoji": app.get("emoji"), "glyph": app.get("glyph"), "icon": app.get("icon"),
+            "favicon": app.get("favicon"),
+            "running": bool(live), "pid": pid,
+            "backgroundOnly": desktop_background_only(app, live, visible),
+            "uptimeSec": ((snap.get(pid) or listener_snap.get(pid) or {}).get("etime")
+                          if pid else None),
+            "kind": app.get("kind") or "service",
+            "attached": bool(app.get("attached")),
+            "lastExit": public_last_exit(app),
+            "health": health,
+            "ports": actual_ports,
+            "openHosts": open_hosts,
+            "listening": listening,
+            "portOccupied": occupied,
+            "portOccupiedPid": configured_listeners[0] if occupied else None,
+            "portOwner": port_owner,
+            # 多张停止卡片可以共享常见开发端口；只有真正启动时的监听占用
+            # 才是冲突。字段保留给旧前端兼容，但不再表示配置重复。
+            "portConflict": False,
+            "portConflictApps": [],
+            "legacyManaged": bool(legacy_pid),
+            "pids": sorted(set(live)),
+            "canStart": bool(app.get('command', '').strip()),
+        })
+    return apps
+
+
+def build_state(cfg, console_port, config_health=None):
+    degraded_reasons = []
+    # 一次 pgid 快照供 build_services / build_apps 共享，避免每轮两次全量 ps。
+    needs_groups = any(
+        app.get("runToken")
+        and isinstance(app.get("lastPgid") or app.get("lastPid"), int)
+        for app in cfg.get("apps") or [])
+    roots = {
+        app.get("lastPgid") or app.get("lastPid")
+        for app in cfg.get("apps") or []
+        if app.get("runToken")
+        and isinstance(app.get("lastPgid") or app.get("lastPid"), int)
+    }
+    groups = pgid_members_map(roots) if needs_groups else None
+    try:
+        services, listeners = build_services(cfg, groups)
+    except Exception as e:
+        LOG.exception("构建服务监控状态失败")
+        services, listeners = [], set()
+        degraded_reasons.append({"component": "services"})
+    try:
+        watched = build_watched(cfg.get("watchedKeywords"))
+    except Exception as e:
+        LOG.exception("构建关注进程状态失败")
+        watched = []
+        degraded_reasons.append({"component": "watched"})
+    try:
+        apps = build_apps(cfg, listeners, groups)
+    except Exception as e:
+        LOG.exception("构建启动台状态失败")
+        apps = []
+        degraded_reasons.append({"component": "apps"})
+    if VERSION_LOAD_ERROR:
+        degraded_reasons.append(
+            {"component": "version", "error": VERSION_LOAD_ERROR})
+    for issue in (config_health or {}).get("issues", []):
+        degraded_reasons.append({"component": "config", "error": issue})
+    return {
+        "services": services,
+        "watched": watched,
+        "apps": apps,
+        "watchedKeywords": cfg.get("watchedKeywords") or [],
+        "consolePort": console_port,
+        "consolePid": SELF_PID,
+        "consoleCwd": BASE_DIR,
+        "dataDir": DATA_DIR,
+        "logsDir": LOGS_DIR,
+        "platform": sys.platform,
+        "version": APP_VERSION,
+        "schemaVersion": cfg.get("schemaVersion", CURRENT_SCHEMA_VERSION),
+        "degraded": bool(degraded_reasons),
+        "degradedReasons": degraded_reasons,
+        "configHealth": dict(config_health or {}),
+        "uiTheme": cfg.get("uiTheme") or DEFAULT_UI_THEME,
+        "themes": list_themes(),
+    }
+
+
+# ---------------------------------------------------------------- 状态快照缓存
+# 每次快照要跑约十余个 ps/lsof 子进程。TTL 略大于前端 2s 轮询周期：
+# 单标签页约每 2-3 轮重建一次，多标签页请求自动合并（锁内构建排队后
+# 第二个请求直接命中缓存）。配置/进程变更时 invalidate 立即失效。
+# Windows 的 netstat/PowerShell 进程扫描比 macOS 的 ps/lsof 更容易偶发
+# 超过一个 2s 轮询周期；稍长缓存既能合并并发请求，也避免前端误报断连。
+STATE_CACHE_TTL = 4.0 if IS_WIN else 2.2  # 秒
+_state_cache_lock = threading.Lock()
+_state_cache = {"mono": 0.0, "state": None}
+
+
+def invalidate_state_cache():
+    with _state_cache_lock:
+        _state_cache["state"] = None
+    _invalidate_win_process_cache()
+
+
+def get_state_snapshot(cfg, console_port):
+    monitor = vars(cfg).get('monitor')
+    if monitor is not None:
+        return monitor.snapshot(active=True)
+    now = time.monotonic()
+    with _state_cache_lock:
+        cached = _state_cache["state"]
+        if cached is not None and now - _state_cache["mono"] < STATE_CACHE_TTL:
+            return cached
+        state = build_state(cfg.snapshot(), console_port, cfg.health_info())
+        _state_cache["mono"] = time.monotonic()
+        _state_cache["state"] = state
+        return state
+
+
+def build_health(cfg):
+    """不执行 ps/lsof 的轻量健康检查。"""
+    health = cfg.health_info()
+    issues = list(health.get("issues") or [])
+    if VERSION_LOAD_ERROR:
+        issues.append("VERSION 读取失败: %s" % VERSION_LOAD_ERROR)
+    for label, path in (("data", DATA_DIR), ("icons", ICONS_DIR),
+                        ("logs", LOGS_DIR)):
+        if not os.path.isdir(path):
+            issues.append("%s 目录不存在" % label)
+        elif not os.access(path, os.R_OK | os.W_OK | os.X_OK):
+            issues.append("%s 目录不可读写" % label)
+        elif not IS_WIN:
+            # Windows 无 POSIX 权限位（文件恒为 0666/0444 风格），
+            # 目录/文件权限由 NTFS ACL 保障，跳过位检查。
+            try:
+                mode = os.lstat(path).st_mode
+                if stat.S_ISLNK(mode) or mode & 0o077:
+                    issues.append("%s 目录权限不是 0700" % label)
+            except OSError as e:
+                issues.append("无法检查 %s 目录: %s" % (label, e))
+    for label, path in (("config", CONFIG_PATH),
+                        ("configBackup", CONFIG_PATH + ".bak")):
+        try:
+            mode = os.lstat(path).st_mode
+        except FileNotFoundError:
+            if label == "config":
+                issues.append("主配置文件不存在")
+            continue
+        except OSError as e:
+            issues.append("无法检查 %s: %s" % (label, e))
+            continue
+        if IS_WIN:
+            continue
+        if not stat.S_ISREG(mode) or mode & 0o077:
+            issues.append("%s 文件权限不是 0600" % label)
+    degraded = bool(issues)
+    snapshot = cfg.snapshot()
+    return {
+        "ok": not degraded,
+        "status": "degraded" if degraded else "ok",
+        "platform": sys.platform,
+        "version": APP_VERSION,
+        "schemaVersion": snapshot.get(
+            "schemaVersion", CURRENT_SCHEMA_VERSION),
+        "degraded": degraded,
+        "issues": issues,
+        "config": health,
+    }
+
+
+def list_themes():
+    """注册原有平铺主题和 packs/<name>/ 素材包；默认主题固定排在首位。"""
+    themes = []
+    try:
+        names = sorted(os.listdir(THEMES_DIR))
+    except OSError:
+        return themes
+    manifests = [(os.path.join(THEMES_DIR, name), None)
+                 for name in names if name.endswith(".json")]
+    packs_dir = os.path.join(THEMES_DIR, "packs")
+    if os.path.isdir(packs_dir):
+        manifests.extend((os.path.join(packs_dir, name, "theme.json"), name)
+                         for name in sorted(os.listdir(packs_dir))
+                         if re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,58}", name)
+                         and os.path.isfile(os.path.join(packs_dir, name, "theme.json")))
+    for path, pack in manifests:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            theme_id = "pack-" + pack if pack else str(meta.get("id") or os.path.splitext(os.path.basename(path))[0])
+            if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", theme_id, re.I):
+                continue
+            css = "packs/" + pack + "/theme.css" if pack else theme_id + ".css"
+            if not os.path.isfile(os.path.join(THEMES_DIR, css)):
+                continue
+            theme = {
+                "id": theme_id,
+                "name": str(meta.get("name") or theme_id),
+                "author": str(meta.get("author") or ""),
+                "desc": str(meta.get("desc") or ""),
+                "colors": [str(c) for c in (meta.get("colors") or [])][:6],
+            }
+            if pack:
+                theme.update(kind="elements", css="/themes/" + css)
+                for ext in ("webp", "png", "svg"):
+                    preview = "packs/" + pack + "/preview." + ext
+                    if os.path.isfile(os.path.join(THEMES_DIR, preview)):
+                        theme["preview"] = "/themes/" + preview
+                        break
+            themes.append(theme)
+        except Exception:
+            LOG.exception("读取主题清单失败: %s", path)
+    themes.sort(key=lambda t: t["id"] != DEFAULT_UI_THEME)
+    return themes
+
+
+# ---------------------------------------------------------------- 进程/应用操作
+
+def process_uid(pid):
+    """返回进程所有者身份；进程不存在或不可验证时返回 None。"""
+    if IS_WIN:
+        return _win_owner_uid(pid) if pid_alive(pid) else None
+    out = run_cmd(["ps", "-o", "uid=", "-p", str(int(pid))])
+    toks = out.split()
+    if not toks:
+        return None
+    try:
+        return int(toks[0])
+    except ValueError:
+        return None
+
+
+@contextmanager
+def confirmed_process(pid, created):
+    """Bind a confirmation to its snapshot; pin the Windows PID until done."""
+    if not isinstance(created, str) or not created:
+        raise ValueError('进程身份信息已过期，请刷新后重试')
+    if IS_WIN:
+        handle = _KERNEL32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            raise ValueError('进程已退出或无法确认身份，请刷新后重试')
+        try:
+            values = [ctypes.c_ulonglong() for _ in range(4)]
+            code = wintypes.DWORD()
+            if (not _KERNEL32.GetProcessTimes(handle, *[ctypes.byref(v) for v in values])
+                    or str(values[0].value) != created
+                    or not _KERNEL32.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value != 259):
+                raise ValueError('目标进程已经变化，请刷新后重试')
+            yield
+        finally:
+            _KERNEL32.CloseHandle(handle)
+    else:
+        current = ' '.join(run_cmd(['ps', '-p', str(pid), '-o', 'lstart=']).split())
+        if not current or current != created:
+            raise ValueError('目标进程已经变化，请刷新后重试')
+        yield
+
+
+def kill_process(pid, force):
+    """结束单个进程；只允许当前用户的进程。返回 (ok, error)。"""
+    if pid == SELF_PID:
+        return False, "不能结束总控台自身进程"
+    uid = process_uid(pid)
+    if uid is None:
+        return False, "进程不存在"
+    if uid != SELF_UID:
+        return False, "只能结束当前用户的进程"
+    if IS_WIN:
+        return _win_stop_process(pid, tree=False, force=bool(force))
+    sig = signal.SIGKILL if force else signal.SIGTERM
+    try:
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        return False, "进程不存在"
+    except PermissionError:
+        return False, "没有权限结束该进程"
+    except OSError as e:
+        return False, "结束失败: %s" % e
+    return True, None
+
+
+def stop_pid_tree(pid, sig=signal.SIGTERM, force=False):
+    """向受控进程组发信号；返回 (ok, error)。
+
+    ProcessLookupError means the target completed between validation and the
+    signal and is therefore an idempotent success. Permission and other OS
+    failures must never be swallowed: callers use them to retain management
+    identity instead of creating an orphan process.
+    Windows：使用 taskkill /T；失败保留身份，只有明确 force 才使用 /F。
+    """
+    if IS_WIN:
+        ok, error = _win_stop_process(
+            int(pid), tree=True,
+            force=bool(force or sig == getattr(signal, "SIGKILL", None)))
+        if ok:
+            return True, None
+        if not pid_alive(int(pid)):  # 目标已在验证与信号之间退出：幂等成功
+            return True, None
+        return False, error or "无法停止受控进程树"
+    try:
+        os.killpg(int(pid), sig)
+        return True, None
+    except ProcessLookupError:
+        return True, None
+    except PermissionError:
+        return False, "没有权限停止受控进程组"
+    except OSError as e:
+        return False, "停止受控进程组失败: %s" % e
+
+
+def app_running(app, listeners=None):
+    return bool(managed_pids(app) or legacy_managed_pid(app, listeners))
+
+
+def app_alive_sign(app, listeners=None):
+    """start/stop 的存活判断：新版 token 或严格校验通过的旧版身份。"""
+    return app_running(app, listeners)
+
+
+def app_identity_uncertain(app):
+    """A present but unreadable anchor must not be mistaken for an exit."""
+    if not IS_WIN:
+        return False
+    pid = (app.get('externalIdentity') or {}).get('pid') or app.get('lastPid')
+    if not pid:
+        return False
+    table = _win_process_table()
+    row = table.get(pid)
+    if not row:
+        return bool(_NATIVE_METRICS and pid in _NATIVE_METRICS.seen_pids)
+    identity = app.get('externalIdentity')
+    if identity and row.get('identity') != identity['created']:
+        return False
+    return not row.get('exe') or not row.get('args') or process_uid(pid) is None
+
+
+def build_launch_env(token, environ=None):
+    """构建无 Terminal 启动时仍可找到常见开发工具的环境。
+
+    Finder/LSUIElement 启动的应用通常只有系统 PATH，不会读取用户 shell 配置；
+    因此显式补入 Homebrew、npm/pnpm、Volta、NVM、fnm 等常见目录。
+    """
+    env = dict(os.environ if environ is None else environ)
+    if IS_WIN:
+        # Windows 的用户 PATH 本来就包含 npm/node 等安装目录；无需补路径。
+        env[RUN_TOKEN_ENV] = token
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+        env.setdefault("PYTHONUTF8", "1")
+        return env
+    home = os.path.expanduser("~")
+    preferred = [
+        os.path.join(home, ".local", "bin"),
+        os.path.join(home, ".volta", "bin"),
+        os.path.join(home, ".bun", "bin"),
+        os.path.join(home, "Library", "pnpm"),
+        os.path.join(home, ".asdf", "shims"),
+        "/opt/homebrew/bin", "/opt/homebrew/sbin",
+        "/usr/local/bin", "/usr/local/sbin",
+    ]
+    preferred.extend(sorted(
+        glob.glob(os.path.join(home, ".nvm", "versions", "node", "*", "bin")),
+        reverse=True))
+    preferred.extend(sorted(
+        glob.glob(os.path.join(home, ".fnm", "node-versions", "*", "installation", "bin")),
+        reverse=True))
+    preferred.extend((env.get("PATH") or "").split(os.pathsep))
+    preferred.extend(("/usr/bin", "/bin", "/usr/sbin", "/sbin"))
+    seen = set()
+    env["PATH"] = os.pathsep.join(
+        path for path in preferred if path and not (path in seen or seen.add(path)))
+    env.setdefault("PNPM_HOME", os.path.join(home, "Library", "pnpm"))
+    env[RUN_TOKEN_ENV] = token
+    return env
+
+
+def start_app(app, extra_env=None):
+    """返回 (ok, error, proc|None, pgid|None, token|None)。"""
+    _ensure_private_dir(LOGS_DIR)
+    log_path = os.path.join(LOGS_DIR, "%s.log" % app["id"])
+    rotate_log_file(log_path)
+    cwd = app.get("cwd") or os.path.expanduser("~")
+    try:
+        log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                         0o600)
+        if hasattr(os, "fchmod"):
+            os.fchmod(log_fd, 0o600)
+        logf = os.fdopen(log_fd, "ab", buffering=0)
+    except OSError as e:
+        return False, "无法打开日志文件: %s" % e, None, None, None
+    token = secrets.token_urlsafe(24)
+    env = build_launch_env(token)
+    if extra_env:
+        env.update(extra_env)
+    marker = RUN_TOKEN_ARG_PREFIX + token
+    if IS_WIN:
+        return _start_app_windows(app, cwd, logf, env, marker, token)
+    # 外层 shell 在 argv[0] 中持有随机标记并等待内层；内层等待用户命令
+    # 留下的后台作业。因此进程组既可验证，也不会因启动脚本过早退出而失去锚点。
+    outer_script = '/bin/bash -c "$1"\nconsole_status=$?\nexit "$console_status"'
+    inner_script = (app["command"] +
+                    '\nconsole_status=$?\nwait\nexit "$console_status"')
+    try:
+        header = "\n===== 启动于 %s =====\n" % time.strftime("%Y-%m-%d %H:%M:%S")
+        logf.write(header.encode("utf-8"))
+        proc = subprocess.Popen(
+            ["/bin/bash", "-c", outer_script, marker, inner_script],
+            cwd=cwd, stdout=logf, stderr=subprocess.STDOUT,
+            start_new_session=True, env=env)
+    except Exception as e:
+        logf.close()
+        return False, "启动失败: %s" % e, None, None, None
+    logf.close()  # 子进程已持有副本，父进程关闭避免 fd 泄漏
+    return True, None, proc, proc.pid, token
+
+
+def _start_app_windows(app, cwd, logf, env, marker, token):
+    """Windows 启动：python 锚点持有 marker，内部按所选解释器运行命令。
+
+    锚点等整棵进程树清空后才退出（等价于 macOS 外层 bash 的 wait），
+    因此服务/任务完成后的退出码、日志和“仍在运行”判定都能复现。
+    受控身份 = 锚点 PID + marker 命令行 + PPID 后代树。
+    """
+    anchor = os.path.join(BASE_DIR, "tools", "win_anchor.py")
+    if not os.path.isfile(anchor):
+        logf.close()
+        return False, "缺少 tools/win_anchor.py，无法在 Windows 启动应用", None, None, None
+    try:
+        header = "\n===== 启动于 %s =====\n" % time.strftime("%Y-%m-%d %H:%M:%S")
+        logf.write(header.encode("utf-8"))
+        proc = subprocess.Popen(
+            [sys.executable, anchor, marker, app["command"], app_shell(app)],
+            cwd=cwd, stdin=subprocess.DEVNULL, stdout=logf, stderr=subprocess.STDOUT,
+            creationflags=independent_windows_flags(),
+            env=env)
+        _invalidate_win_process_cache()
+    except Exception as e:
+        logf.close()
+        if getattr(e, 'winerror', None) == 5:
+            return False, 'Windows 拒绝独立启动；请从项目根目录的 start.bat 或独立终端启动总控台，避免宿主任务限制', None, None, None
+        return False, "启动失败: %s" % e, None, None, None
+    logf.close()  # 子进程已持有副本，父进程关闭避免 fd 泄漏
+    return True, None, proc, proc.pid, token
+
+
+def startup_failure_message(app_id, code):
+    """从日志末尾提取一行可直接显示给用户的启动错误。"""
+    text = read_log_tail(app_id, 30)
+    for line in reversed(text.splitlines()):
+        line = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", line).strip()
+        if line and not line.startswith("====="):
+            if len(line) > 180:
+                line = line[:179] + "…"
+            return "启动命令立即退出（exit %s）：%s" % (code, line)
+    return "启动命令立即退出（exit %s），请查看日志" % code
+
+
+def watch_app_exit(cfg, app_id, proc, token, started_at=None):
+    """后台线程等子进程退出：若期间未被手动 stop/重启（lastPid 仍指向它），
+    记录 lastExit（退出码、结束时间和运行耗时）。保留 lastPid 作为进程组锚点——
+    脚本可能把服务放后台后退出，后续的运行判定/停止都靠 pgid 找到存活成员。"""
+    started_at = time.time() if started_at is None else started_at
+
+    def _wait():
+        code = proc.wait()
+        ended_at = time.time()
+        duration = round(max(0.0, ended_at - started_at), 3)
+
+        with MANUAL_STOP_LOCK:
+            manually_stopped = (app_id, token) in MANUAL_STOP_TOKENS
+
+        def op(c):
+            target = find_app(c, app_id)
+            if (not manually_stopped and target
+                    and target.get("lastPid") == proc.pid
+                    and target.get("runToken") == token):
+                last_exit = {
+                    "code": code,
+                    "at": int(ended_at),
+                    "startedAt": int(started_at * 1000),
+                    "durationSec": duration,
+                }
+                if (target.get("kind") or "service") == "task":
+                    last_exit["status"] = classify_task_exit(code)
+                target["lastExit"] = last_exit
+        cfg.update(op)
+        rotate_log_file(os.path.join(LOGS_DIR, "%s.log" % app_id))
+    thread = threading.Thread(target=_wait, daemon=True)
+    thread.start()
+    return thread
+
+
+def persist_started_app(cfg, app_id, proc, pgid, token):
+    """保存新的受控身份并启动退出监视线程。"""
+    started_at = time.time()
+
+    def op(c):
+        target = find_app(c, app_id)
+        if target:
+            target["lastPid"] = proc.pid
+            target["lastPgid"] = pgid
+            target["runToken"] = token
+            target["attached"] = False
+            target['externalIdentity'] = None
+            target['expectedRunning'] = True
+            target['startedAt'] = started_at
+            # 批处理任务运行时先保留上一次结果；自然退出或手动停止后再原子覆盖。
+            if (target.get("kind") or "service") != "task":
+                target["lastExit"] = None
+            return True
+        return False
+    saved = cfg.update(op)
+    if saved:
+        watch_app_exit(cfg, app_id, proc, token, started_at)
+    return saved
+
+
+def clear_app_runtime(cfg, app_id, expected_token=None, last_exit=None):
+    """清除受控身份；可用 token 防竞态，并可原子写入本次退出结果。"""
+    def op(c):
+        target = find_app(c, app_id)
+        if not target:
+            return False
+        if expected_token is not None and target.get("runToken") != expected_token:
+            return False
+        target["lastPid"] = None
+        target["lastPgid"] = None
+        target["runToken"] = None
+        target["attached"] = False
+        target['externalIdentity'] = None
+        target['expectedRunning'] = False
+        if last_exit is not None:
+            target["lastExit"] = last_exit
+        return True
+    return cfg.update(op)
+
+
+def stop_app_for_update(cfg, app, timeout=5.0):
+    """为修改运行参数安全停止应用；返回 (ok, error, stopped)。"""
+    if not app_alive_sign(app):
+        return True, None, False
+    ok, error = stop_app_and_clear(cfg, app, timeout)
+    return ok, error, bool(ok)
+
+
+def pick_path(what):
+    """macOS 原生文件/目录选择框（osascript）。返回 (path|None, canceled)。"""
+    if IS_WIN:
+        return _pick_path_windows(what)
+    if what == "dir":
+        script = 'POSIX path of (choose folder with prompt "选择工作目录")'
+    else:
+        script = 'POSIX path of (choose file with prompt "选择批处理脚本")'
+    try:
+        r = subprocess.run(["osascript", "-e", script],
+                           capture_output=True, text=True, timeout=180)
+    except Exception:
+        return None, False
+    if r.returncode != 0:  # 用户按了取消（"User canceled."）
+        return None, True
+    return r.stdout.strip().rstrip("/") or None, False
+
+
+def _pick_path_windows(what):
+    """Windows 原生对话框（PowerShell + WinForms）。返回 (path|None, canceled)。"""
+    owner_prefix = (
+        "Add-Type -AssemblyName System.Windows.Forms; "
+        "Add-Type -AssemblyName System.Drawing; "
+        "$owner = New-Object System.Windows.Forms.Form; "
+        "$owner.FormBorderStyle = 'None'; "
+        "$owner.ShowInTaskbar = $false; $owner.TopMost = $true; "
+        "$owner.Opacity = 0; $owner.Size = New-Object System.Drawing.Size(1,1); "
+        "$owner.StartPosition = 'CenterScreen'; $owner.Show(); $owner.Activate(); "
+    )
+    # ShowDialog() 无 owner 时，后台 HTTP 进程创建的对话框容易被浏览器遮挡。
+    # 独立的置顶 owner 只在选择期间存在；所有退出路径都释放窗口与对话框。
+    owner_suffix = (
+        " finally { if ($f) { $f.Dispose() }; "
+        "if ($owner) { $owner.Close(); $owner.Dispose() } }"
+    )
+    if what == "dir":
+        script = (
+            owner_prefix +
+            "$f = New-Object System.Windows.Forms.FolderBrowserDialog; "
+            "$f.Description = '选择工作目录'; "
+            "$f.ShowNewFolderButton = $true; "
+            "try { if ($f.ShowDialog($owner) -eq "
+            "[System.Windows.Forms.DialogResult]::OK) "
+            "{ $f.SelectedPath } else { '__CANCELED__' } }" +
+            owner_suffix)
+    else:
+        script = (
+            owner_prefix +
+            "$f = New-Object System.Windows.Forms.OpenFileDialog; "
+            "$f.Title = '选择批处理脚本'; "
+            "$f.Filter = '脚本文件 (*.py;*.ps1;*.bat;*.cmd;*.sh)|*.py;*.ps1;*.bat;*.cmd;*.sh|所有文件 (*.*)|*.*'; "
+            "try { if ($f.ShowDialog($owner) -eq "
+            "[System.Windows.Forms.DialogResult]::OK) "
+            "{ $f.FileName } else { '__CANCELED__' } }" +
+            owner_suffix)
+    text = _win_powershell(script, timeout=180, sta=True).strip()
+    if not text:
+        return None, False
+    if text == "__CANCELED__":
+        return None, True
+    # FolderBrowserDialog normally omits the separator, but normalize a
+    # selected child path while preserving drive roots such as ``D:\``.
+    if len(text) > 3:
+        text = text.rstrip("/\\")
+    return text or None, False
+
+
+def command_for_script(path, shell=None):
+    """按脚本类型生成可直接保存的 shell 命令，并安全引用任意文件名。"""
+    normalized = os.path.abspath(os.path.expanduser(str(path)))
+    suffix = os.path.splitext(normalized)[1].lower()
+    if IS_WIN:
+        if shell == "powershell":
+            quoted = "'" + normalized.replace("'", "''") + "'"
+            if suffix == ".py":
+                runner = "py -3" if shutil.which("py") else "python"
+                return "%s -- %s" % (runner, quoted)
+            if suffix in (".sh", ".bash", ".command", ".zsh"):
+                return "%s -- %s" % ("zsh" if suffix == ".zsh" else "bash", quoted)
+            return "& " + quoted
+        quoted = _win_quote(normalized)
+        if suffix == ".py":
+            runner = "py -3" if shutil.which("py") else "python"
+            return "%s -- %s" % (runner, quoted)
+        if suffix == ".ps1":
+            return "powershell -NoProfile -ExecutionPolicy Bypass -File %s" % quoted
+        if suffix in (".bat", ".cmd", ".exe", ".com"):
+            return quoted
+        if suffix in (".sh", ".bash", ".command", ".zsh"):
+            return "%s -- %s" % ("zsh" if suffix == ".zsh" else "bash", quoted)
+        if os.access(normalized, os.R_OK):
+            return quoted
+        return quoted
+    quoted = shlex.quote(normalized)
+    if suffix == ".py":
+        return "python3 -- %s" % quoted
+    if suffix == ".zsh":
+        return "/bin/zsh -- %s" % quoted
+    if suffix in (".sh", ".bash"):
+        return "/bin/bash -- %s" % quoted
+    if os.access(normalized, os.X_OK):
+        return quoted
+    # .command 常见于 Finder 双击脚本；没有执行位时仍可明确交给 bash。
+    return "/bin/bash -- %s" % quoted
+
+
+SCRIPT_SUFFIXES = {".py", ".sh", ".bash", ".zsh", ".command",
+                   ".ps1", ".bat", ".cmd"}
+SHELL_BUILTINS = {
+    ".", ":", "[", "alias", "break", "cd", "command", "continue", "echo",
+    "eval", "exec", "exit", "export", "false", "printf", "pwd", "read",
+    "return", "set", "shift", "source", "test", "true", "type", "ulimit",
+    "umask", "unalias", "unset", "wait",
+}
+
+
+def _simple_command_tokens(command):
+    """解析无管道/重定向/展开的简单命令；不确定时返回 None。"""
+    if not isinstance(command, str) or not command.strip():
+        return []
+    if IS_WIN:
+        # CMD 不把反斜杠或单引号当作 POSIX 转义。仅解析独立的双引号参数；
+        # 展开、控制符、混合引号等交回解释器，不能据此错误禁用启动。
+        if any(c in command for c in '%!^\r\n'):
+            return None
+        word = r'(?:"[^"\r\n]*"|[^\s"]+)'
+        if not re.fullmatch(r'\s*' + word + r'(?:\s+' + word + r')*\s*', command):
+            return None
+        parts = re.findall(word, command)
+        tokens = []
+        for part in parts:
+            if part.startswith('"'):
+                tokens.append(part[1:-1])
+            elif any(c in part for c in '|&;<>()*?'):
+                return None
+            else:
+                tokens.append(part)
+        return tokens
+    try:
+        lexer = shlex.shlex(
+            command, posix=True, punctuation_chars="|&;<>()")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    if not tokens:
+        return []
+    if any(token and all(char in "|&;<>()" for char in token)
+           for token in tokens):
+        return None
+    # 健康检查绝不展开变量、通配符或命令替换；这类命令照常允许运行。
+    if any(any(char in token for char in ("$", "*", "?", "[", "]", "`"))
+           for token in tokens):
+        return None
+    return tokens
+
+
+def _resolve_command_path(value, cwd):
+    value = os.path.expanduser(value)
+    if os.path.isabs(value):
+        return os.path.normpath(value)
+    return os.path.normpath(os.path.join(cwd, value))
+
+
+def _powershell_script_tokens(command):
+    """只检查自动生成形式中的明确文件路径；cmdlet、展开和表达式保持 unknown。"""
+    word = r"(?:'(?:[^']|'')*'|[\w.:/\\-]+)"
+    match = re.fullmatch(r'\s*(?:&\s+)?(' + word + r'(?:\s+' + word + r')*)\s*', command)
+    if not match:
+        return None
+    tokens = [part[1:-1].replace("''", "'") if part.startswith("'") else part
+              for part in re.findall(word, match.group(1))]
+    path, _, _ = _script_target(tokens, os.path.expanduser('~'))
+    return tokens if path else None
+
+
+def _script_target(tokens, cwd):
+    """提取 (路径, 是否直接执行, 原路径是否相对)，否则返回空。"""
+    if not tokens:
+        return None, False, False
+    index = 0
+    while index < len(tokens) and re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[index]):
+        index += 1
+    if index >= len(tokens):
+        return None, False, False
+    executable = tokens[index]
+    base = os.path.basename(executable)
+    if IS_WIN:
+        base = base.lower().removesuffix('.exe')
+    args = tokens[index + 1:]
+
+    if IS_WIN and base in {"powershell", "pwsh"}:
+        lowered = [arg.lower() for arg in args]
+        if '-file' in lowered:
+            position = lowered.index('-file') + 1
+            if position < len(args):
+                candidate = args[position]
+                return (_resolve_command_path(candidate, cwd), False,
+                        not os.path.isabs(candidate))
+        return None, False, False
+
+    if IS_WIN and base in {"call"}:
+        return _script_target(args, cwd)
+
+    if re.fullmatch(r"(?:python(?:\d+(?:\.\d+)*)?|py(?:-\d+(?:\.\d+)*)?)", base):
+        if "-m" in args or "-c" in args:
+            return None, False, False
+        if args and args[0] == "--":
+            args = args[1:]
+        candidate = next((arg for arg in args if not arg.startswith("-")), None)
+        if candidate and (os.path.splitext(candidate)[1].lower() in SCRIPT_SUFFIXES
+                          or "/" in candidate or "\\" in candidate):
+            return (_resolve_command_path(candidate, cwd), False,
+                    not os.path.isabs(os.path.expanduser(candidate)))
+        return None, False, False
+
+    if base in {"bash", "sh", "zsh"}:
+        if any(arg == "--command"
+               or (arg.startswith("-") and "c" in arg[1:])
+               for arg in args):
+            return None, False, False
+        if args and args[0] == "--":
+            args = args[1:]
+        candidate = next((arg for arg in args if not arg.startswith("-")), None)
+        if candidate and (os.path.splitext(candidate)[1].lower() in SCRIPT_SUFFIXES
+                          or "/" in candidate or "\\" in candidate):
+            return (_resolve_command_path(candidate, cwd), False,
+                    not os.path.isabs(os.path.expanduser(candidate)))
+        return None, False, False
+
+    suffix = os.path.splitext(executable)[1].lower()
+    if suffix in SCRIPT_SUFFIXES or "/" in executable or "\\" in executable:
+        target = _resolve_command_path(executable, cwd)
+        if (IS_WIN and suffix in ('.bat', '.cmd') and not os.path.isfile(target)
+                and '/' not in executable and '\\' not in executable):
+            # npm.cmd / pnpm.cmd 等通常来自 PATH，不在项目目录。
+            target = shutil.which(executable, path=build_launch_env('health-check').get('PATH')) or target
+        return (target, True,
+                not os.path.isabs(os.path.expanduser(executable)))
+    return None, False, False
+
+
+def inspect_app_health(app):
+    """静态检查配置是否可运行；只读文件系统，绝不执行或展开用户命令。"""
+    if not (app.get('command') or '').strip():
+        return {'status': 'unknown', 'blocking': True, 'issues': [{
+            'kind': 'observation', 'severity': 'info', 'title': '观察卡片：未配置启动命令',
+            'detail': '可查看运行状态；填写可靠的启动命令后启用启动和重启。',
+            'fix': '编辑启动命令', 'action': 'edit-command'}]}
+    issues = []
+
+    def add(kind, title, detail, fix, action):
+        issues.append({
+            "kind": kind,
+            "severity": "error",
+            "title": title,
+            "detail": detail,
+            "fix": fix,
+            "action": action,
+        })
+
+    configured_cwd = app.get("cwd")
+    cwd = configured_cwd or os.path.expanduser("~")
+    cwd_ok = os.path.isdir(cwd)
+    if configured_cwd and not cwd_ok:
+        add(
+            "cwd-missing", "工作目录不可用",
+            "找不到配置的工作目录：%s" % configured_cwd,
+            "编辑这个项目，重新选择工作区文件夹。",
+            "pick-cwd",
+        )
+
+    shell = app_shell(app)
+    if shell not in (("cmd", "powershell") if IS_WIN else ("bash",)):
+        add("shell-unavailable", "执行方式不适用于当前系统", shell,
+            "编辑项目，选择当前系统支持的执行方式。", "edit-command")
+    # PowerShell 可调用 cmdlet、函数、表达式；无法用 PATH 判定它们是否存在。
+    tokens = (_powershell_script_tokens(app.get("command") or "") if shell == "powershell" else
+              _simple_command_tokens(app.get("command") or ""))
+    if tokens is None:
+        return {
+            "status": "error" if issues else "unknown",
+            "blocking": bool(issues),
+            "issues": issues,
+        }
+
+    script_path, direct, script_was_relative = _script_target(tokens, cwd)
+    if script_path and (cwd_ok or not script_was_relative):
+        if not os.path.isfile(script_path):
+            add(
+                "script-missing", "脚本不可用",
+                "找不到脚本：%s" % script_path,
+                "编辑这个任务，重新选择脚本或修改执行命令。",
+                "pick-script",
+            )
+        elif not os.access(script_path, os.R_OK):
+            add(
+                "path-unreadable", "脚本不可读取",
+                "当前用户没有读取权限：%s" % script_path,
+                "检查脚本权限，或重新选择一个可读取的脚本。",
+                "pick-script",
+            )
+        elif direct and not IS_WIN and not os.access(script_path, os.X_OK):
+            add(
+                "script-not-executable", "脚本不可执行",
+                "直接运行的脚本没有执行权限：%s" % script_path,
+                "给脚本执行权限，或改为使用 bash / python3 执行。",
+                "edit-command",
+            )
+        elif (IS_WIN and direct
+              and not (shell == "powershell" and script_path.lower().endswith('.ps1'))
+              and os.path.splitext(script_path)[1].lower() in SCRIPT_SUFFIXES - {'.bat', '.cmd'}):
+            add("script-runtime-required", "脚本需要指定解释器",
+                "当前执行方式需要为此脚本指定解释器：%s" % script_path,
+                "使用“选择脚本”重新生成命令，例如：%s" % command_for_script(script_path, shell),
+                "pick-script")
+
+    # 直接脚本已由上面的文件检查覆盖；其他简单命令检查首个运行时。
+    index = 0
+    while tokens and index < len(tokens) and re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[index]):
+        index += 1
+    executable = tokens[index] if tokens and index < len(tokens) else ""
+    executable_base = os.path.basename(executable)
+    builtins = ({"assoc", "break", "call", "cd", "chdir", "cls", "color", "copy",
+                 "date", "del", "dir", "echo", "endlocal", "erase", "exit", "for",
+                 "ftype", "if", "md", "mkdir", "mklink", "move", "path", "pause",
+                 "popd", "prompt", "pushd", "rd", "rem", "ren", "rename", "rmdir",
+                 "set", "setlocal", "shift", "start", "time", "title", "type", "ver",
+                 "verify", "vol"} if IS_WIN else SHELL_BUILTINS)
+    builtin_name = executable_base.lower() if IS_WIN else executable_base
+    if executable and not direct and builtin_name not in builtins:
+        if "/" in executable or (IS_WIN and "\\" in executable):
+            runtime = _resolve_command_path(executable, cwd)
+            runtime_ok = os.path.isfile(runtime) and os.access(runtime, os.X_OK)
+        else:
+            runtime = executable
+            runtime_ok = bool(shutil.which(
+                executable, path=build_launch_env("health-check").get("PATH")))
+        if not runtime_ok:
+            add(
+                "runtime-missing", "找不到 %s" % executable_base,
+                "总控台的运行环境里找不到命令：%s" % executable,
+                "安装对应运行时，或在编辑中修改执行命令。",
+                "edit-command",
+            )
+
+    return {
+        "status": "error" if issues else "ok",
+        "blocking": bool(issues),
+        "issues": issues,
+    }
+
+
+# ---------------------------------------------------------------- 项目启动识别
+
+def _read_project_text(root, name):
+    """只读取项目根目录下的小型文本配置；不存在、过大或不可读均返回 None。"""
+    path = os.path.join(root, name)
+    try:
+        if not os.path.isfile(path) or os.path.getsize(path) > MAX_DETECT_FILE_BYTES:
+            return None
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read(MAX_DETECT_FILE_BYTES + 1)
+    except OSError:
+        return None
+
+
+def _port_from_command(command):
+    """从常见 CLI 参数和环境变量中提取显式端口。"""
+    patterns = (
+        r"(?:^|\s)--port(?:=|\s+)(\d{1,5})(?=\s|$)",
+        r"(?:^|\s)-p\s+(\d{1,5})(?=\s|$)",
+        r"(?:^|\s)PORT\s*=\s*(\d{1,5})(?=\s|$)",
+        r"(?:localhost|127\.0\.0\.1|0\.0\.0\.0):(\d{1,5})",
+        r"\bhttp\.server\s+(\d{1,5})(?=\s|$)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, command, re.IGNORECASE)
+        if match:
+            port = int(match.group(1))
+            if 1 <= port <= 65535:
+                return port
+    return None
+
+
+def _package_default_port(script_name, command, dependencies):
+    """根据直接依赖和脚本内容给出开发服务器的惯用端口。"""
+    haystack = " ".join((script_name, command, " ".join(dependencies))).lower()
+    defaults = (
+        (("hexo",), 4000),
+        (("gatsby",), 8000),
+        (("@docusaurus/", "docusaurus"), 3000),
+        (("vuepress",), 8080),
+        (("docsify",), 3000),
+        (("eleventy", "@11ty/eleventy"), 8080),
+        (("astro",), 4321),
+        (("next", "nextjs"), 3000),
+        (("nuxt",), 3000),
+        (("react-scripts",), 3000),
+        (("vue-cli-service", "@vue/cli-service"), 8080),
+        (("vite",), 4173 if script_name == "preview" else 5173),
+    )
+    for needles, port in defaults:
+        if any(needle in haystack for needle in needles):
+            return port
+    return None
+
+
+def detect_project(root):
+    """只读分析项目根目录，返回可由启动台直接使用的启动候选。"""
+    if not isinstance(root, str) or not root.strip():
+        return None, "请选择项目文件夹"
+    root = os.path.abspath(os.path.expanduser(root.strip()))
+    if not os.path.isdir(root):
+        return None, "项目文件夹不存在或不可访问"
+
+    candidates = []
+    detected_files = []
+
+    def note_file(name, text=None):
+        path = os.path.join(root, name)
+        exists = text is not None or os.path.isfile(path)
+        if exists and name not in detected_files:
+            detected_files.append(name)
+        return exists
+
+    def add(command, label, source, port=None, priority=50, detail=None,
+            kind="service"):
+        if not command or any(item["command"] == command for item in candidates):
+            return
+        if port is not None and not (isinstance(port, int) and 1 <= port <= 65535):
+            port = None
+        candidates.append({
+            "command": command,
+            "shell": "cmd" if IS_WIN else "bash",
+            "label": label,
+            "source": source,
+            "port": port,
+            "kind": "task" if kind == "task" else "service",
+            "detail": detail,
+            "_priority": priority,
+        })
+
+    # Node / 前端 / 博客项目：优先读取 package.json 的 scripts。
+    package = {}
+    scripts = {}
+    deps = set()
+    hexo_config = os.path.isfile(os.path.join(root, "_config.yml"))
+    is_hexo = hexo_config and (
+        os.path.isdir(os.path.join(root, "source")) or
+        os.path.isdir(os.path.join(root, "scaffolds")) or
+        os.path.isdir(os.path.join(root, "themes")))
+    package_text = _read_project_text(root, "package.json")
+    if package_text is not None:
+        note_file("package.json", package_text)
+        try:
+            package = json.loads(package_text)
+        except (TypeError, ValueError):
+            package = {}
+        scripts = package.get("scripts") if isinstance(package, dict) else {}
+        if not isinstance(scripts, dict):
+            scripts = {}
+        for key in ("dependencies", "devDependencies", "peerDependencies"):
+            values = package.get(key) if isinstance(package, dict) else None
+            if isinstance(values, dict):
+                deps.update(str(name).lower() for name in values)
+        is_hexo = (is_hexo or "hexo" in deps or
+                   (isinstance(package, dict) and isinstance(package.get("hexo"), dict)))
+
+        if os.path.isfile(os.path.join(root, "pnpm-lock.yaml")):
+            runner = "pnpm run"
+            note_file("pnpm-lock.yaml")
+        elif (os.path.isfile(os.path.join(root, "bun.lock")) or
+              os.path.isfile(os.path.join(root, "bun.lockb"))):
+            runner = "bun run"
+            note_file("bun.lock" if os.path.isfile(os.path.join(root, "bun.lock")) else "bun.lockb")
+        elif os.path.isfile(os.path.join(root, "yarn.lock")):
+            runner = "yarn"
+            note_file("yarn.lock")
+        else:
+            runner = "npm run"
+
+        labels = {
+            "dev": "开发服务器", "develop": "开发服务器",
+            "start": "正式启动", "serve": "本地服务", "server": "本地服务",
+            "preview": "本地预览", "docs": "文档站",
+            "storybook": "组件预览",
+        }
+        preferred = ("dev", "develop", "start", "serve", "server", "preview", "docs", "storybook")
+        ordered = [name for name in preferred if name in scripts]
+        service_name = re.compile(r"(?:^|[:_-])(dev|develop|start|serve|server|preview|watch|docs|storybook|web|blog)(?:$|[:_-])", re.I)
+        ordered.extend(name for name in scripts if name not in ordered and service_name.search(str(name)))
+        for index, name in enumerate(ordered[:8]):
+            script = scripts.get(name)
+            if not isinstance(script, str):
+                continue
+            if is_hexo and str(name).lower() == "server" and re.search(
+                    r"\bhexo\s+(?:s|server)\b", script, re.I):
+                continue  # 下方提供更短、更通用的 hexo s，不重复同一操作
+            if IS_WIN:
+                script_arg = str(name) if re.fullmatch(r'[A-Za-z0-9_:.-]+', str(name)) else _win_quote(name)
+            else:
+                script_arg = shlex.quote(str(name))
+            command = "%s %s" % (runner, script_arg)
+            port = _port_from_command(script)
+            if port is None:
+                port = _package_default_port(str(name).lower(), script, deps)
+            add(command, labels.get(str(name).lower(), "项目脚本：%s" % name),
+                "package.json · scripts.%s" % name, port,
+                10 + index, "由项目自己的脚本定义")
+
+    # Hexo 即使没有 scripts 也有稳定 CLI：服务与清缓存分别作为服务/任务。
+    if is_hexo:
+        if hexo_config:
+            note_file("_config.yml")
+        add("hexo s", "Hexo 本地服务", "Hexo 项目结构", 4000, 8,
+            "等同于 hexo server")
+        add("hexo cl", "Hexo 清除缓存", "Hexo 项目结构", None, 9,
+            "清除缓存和已生成文件，不启动服务", kind="task")
+
+    # 常见博客与静态站点生成器。
+    hugo_config = next((name for name in ("hugo.toml", "hugo.yaml", "hugo.yml")
+                        if os.path.isfile(os.path.join(root, name))), None)
+    if hugo_config or (os.path.isdir(os.path.join(root, "content")) and
+                       os.path.isdir(os.path.join(root, "layouts")) and
+                       os.path.isfile(os.path.join(root, "config.toml"))):
+        source = hugo_config or "config.toml"
+        note_file(source)
+        add("hugo server -D", "Hugo 本地预览", source, 1313, 18,
+            "包含草稿内容")
+
+    gemfile = _read_project_text(root, "Gemfile")
+    if gemfile is not None:
+        note_file("Gemfile", gemfile)
+        if "jekyll" in gemfile.lower():
+            add("bundle exec jekyll serve", "Jekyll 本地预览", "Gemfile", 4000, 19)
+
+    # Python Web 项目。
+    pyproject = _read_project_text(root, "pyproject.toml")
+    requirements = _read_project_text(root, "requirements.txt")
+    if pyproject is not None:
+        note_file("pyproject.toml", pyproject)
+    if requirements is not None:
+        note_file("requirements.txt", requirements)
+    py_deps = "\n".join(text for text in (pyproject, requirements) if text).lower()
+    has_uv = os.path.isfile(os.path.join(root, "uv.lock"))
+    if has_uv:
+        note_file("uv.lock")
+    py_base = "python" if IS_WIN else "python3"
+    py_module = "uv run" if has_uv else ("python -m" if IS_WIN else "python3 -m")
+    py_prefix = "uv run python" if has_uv else py_base
+    if os.path.isfile(os.path.join(root, "manage.py")):
+        note_file("manage.py")
+        add(py_prefix + " manage.py runserver", "Django 开发服务器", "manage.py", 8000, 20)
+    else:
+        for module_file in ("app.py", "main.py", "server.py"):
+            module_text = _read_project_text(root, module_file)
+            if module_text is None:
+                continue
+            module = os.path.splitext(module_file)[0]
+            imports_streamlit = re.search(
+                r"(?m)^\s*(?:import\s+streamlit\b|from\s+streamlit\b)", module_text)
+            imports_fastapi = re.search(
+                r"(?m)^\s*(?:import\s+fastapi\b|from\s+fastapi\b)", module_text)
+            imports_flask = re.search(
+                r"(?m)^\s*(?:import\s+flask\b|from\s+flask\b)", module_text)
+            if "streamlit" in py_deps or imports_streamlit:
+                note_file(module_file, module_text)
+                add(py_module + " streamlit run " + module_file,
+                    "Streamlit 应用", module_file, 8501, 22)
+                break
+            if "fastapi" in py_deps or imports_fastapi:
+                note_file(module_file, module_text)
+                add(py_module + " uvicorn %s:app --reload" % module,
+                    "FastAPI 开发服务器", module_file, 8000, 23)
+                break
+            if "flask" in py_deps or imports_flask:
+                note_file(module_file, module_text)
+                add(py_module + " flask --app %s run --debug" % module,
+                    "Flask 开发服务器", module_file, 5000, 24)
+                break
+
+    # Docker Compose、Go、Rust 和已有的常用启动脚本。
+    compose_name = next((name for name in ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml")
+                         if os.path.isfile(os.path.join(root, name))), None)
+    if compose_name:
+        compose_text = _read_project_text(root, compose_name)
+        note_file(compose_name, compose_text)
+        port = None
+        if compose_text:
+            match = re.search(r"[\"']?(\d{2,5})\s*:\s*\d{2,5}[\"']?", compose_text)
+            if match and 1 <= int(match.group(1)) <= 65535:
+                port = int(match.group(1))
+        add("docker compose up", "Docker Compose", compose_name, port, 55,
+            "以前台方式运行，停止按钮可正常关闭")
+    if os.path.isfile(os.path.join(root, "go.mod")):
+        note_file("go.mod")
+        add("go run .", "Go 项目", "go.mod", None, 60)
+    if os.path.isfile(os.path.join(root, "Cargo.toml")):
+        note_file("Cargo.toml")
+        add("cargo run", "Rust 项目", "Cargo.toml", None, 61)
+
+    if IS_WIN:
+        for script_name in ("start.bat", "dev.bat", "run.bat",
+                            "start.cmd", "dev.cmd", "run.cmd", "start.ps1"):
+            if os.path.isfile(os.path.join(root, script_name)):
+                note_file(script_name)
+                add(command_for_script(os.path.join(root, script_name)),
+                    "现有启动脚本", script_name, None, 70,
+                    "也可以继续使用“选择脚本”手动指定")
+                break
+        if shutil.which("bash"):  # Git Bash 可用时同样识别 sh 启动脚本
+            for script_name in ("start.sh", "dev.sh", "run.sh",
+                                "start.command", "dev.command", "run.command"):
+                if os.path.isfile(os.path.join(root, script_name)):
+                    note_file(script_name)
+                    add("bash %s" % _win_quote("./" + script_name),
+                        "现有启动脚本", script_name, None, 71,
+                        "也可以继续使用“选择脚本”手动指定")
+                    break
+    else:
+        for script_name in ("start.command", "dev.command", "run.command", "start.sh", "dev.sh", "run.sh"):
+            if os.path.isfile(os.path.join(root, script_name)):
+                note_file(script_name)
+                add("bash %s" % shlex.quote("./" + script_name),
+                    "现有启动脚本", script_name, None, 70,
+                    "也可以继续使用“选择脚本”手动指定")
+                break
+
+    # 纯静态站点最后兜底，避免把 Vite/Next 等项目误当成普通文件目录。
+    if not candidates and os.path.isfile(os.path.join(root, "index.html")):
+        note_file("index.html")
+        add(py_module + " http.server 8000", "静态网站预览", "index.html", 8000, 90)
+
+    candidates.sort(key=lambda item: item.pop("_priority"))
+    return {
+        "ok": True,
+        "cwd": root,
+        "name": os.path.basename(root) or root,
+        "files": detected_files,
+        "candidates": candidates[:8],
+    }, None
+
+
+def _current_user_group_members(pgid):
+    """Return live current-user members of a previously verified group.
+
+    Once SIGTERM is sent the token-bearing controller may exit before a child
+    that ignores SIGTERM.  Requiring the marker again would incorrectly report
+    success, so the wait phase follows the already-verified PGID until empty.
+    """
+    members = pgid_members_map({pgid}).get(pgid, [])
+    if not members:
+        return []
+    snap = ps_snapshot(members, with_uid=True)
+    return sorted(pid for pid in members
+                  if snap.get(pid, {}).get("uid") == SELF_UID)
+
+
+def resolve_app_stop_target(app, listeners=None):
+    """Resolve and validate a stop target before any signal is sent."""
+    if app.get('externalIdentity'):
+        members = external_pids(app)
+        if members:
+            return {'kind': 'external', 'id': app['externalIdentity']['pid'],
+                    'members': members, 'identity': app['externalIdentity']}, None
+        return None, '外部进程身份已变化，未执行停止'
+    current = managed_pids(app)
+    if current:
+        pgid = app.get("lastPgid") or app.get("lastPid")
+        if isinstance(pgid, int) and pgid > 0:
+            scoped = IS_WIN and bool(set(_win_tree_of(pgid, _win_process_table())) - set(current))
+            return {"kind": "group", "id": pgid, "members": list(current), "scoped": scoped}, None
+        return None, "受控进程组信息无效"
+    legacy_pid = legacy_managed_pid(app, listeners)
+    if legacy_pid:
+        if app.get("attached") and IS_WIN:
+            table = _win_process_table()
+            tree_members = (_win_tree_of(legacy_pid, table)
+                            if legacy_pid in table else [legacy_pid])
+            members = card_process_members(dict(app, lastPid=legacy_pid), tree_members)
+            if len(members) > 1:
+                snap = ps_snapshot(members, with_uid=True)
+                member_cwds = lsof_cwds(members)
+                expected_cwd = app.get("cwd")
+                try:
+                    safe_tree = bool(expected_cwd) and all(
+                        snap.get(pid, {}).get("uid") == SELF_UID
+                        and member_cwds.get(pid)
+                        and os.path.realpath(member_cwds[pid])
+                        == os.path.realpath(expected_cwd)
+                        for pid in members)
+                except OSError:
+                    safe_tree = False
+                if not safe_tree:
+                    return None, "认领进程存在无法验证的子进程，未执行停止"
+                return {
+                    "kind": "group", "id": legacy_pid,
+                    "members": list(members), "scoped": set(members) != set(tree_members),
+                }, None
+        if app.get("attached") and not IS_WIN:
+            try:
+                pgid = os.getpgid(legacy_pid)
+            except (ProcessLookupError, PermissionError, OSError):
+                pgid = None
+            if isinstance(pgid, int) and pgid > 0 and pgid != os.getpgrp():
+                members = _current_user_group_members(pgid)
+                member_cwds = lsof_cwds(members)
+                expected_cwd = app.get("cwd")
+                try:
+                    safe_group = bool(members and expected_cwd) and all(
+                        member_cwds.get(pid)
+                        and os.path.realpath(member_cwds[pid])
+                        == os.path.realpath(expected_cwd)
+                        for pid in members
+                    )
+                except OSError:
+                    safe_group = False
+                if safe_group:
+                    return {
+                        "kind": "group",
+                        "id": pgid,
+                        "members": list(members),
+                    }, None
+        return {"kind": "pid", "id": legacy_pid, "members": [legacy_pid]}, None
+    return None, "无法确认受控进程，未执行停止"
+
+
+def signal_app_stop(target, sig=signal.SIGTERM):
+    """Signal a target returned by resolve_app_stop_target."""
+    ident = target["id"]
+    if IS_WIN:
+        if target['kind'] == 'external' and not external_pids({'externalIdentity': target['identity']}):
+            return False, '外部进程身份已变化'
+        from win_metrics import close_windows
+        if close_windows(set(target.get('members', []))):
+            return True, None
+    if target["kind"] == "group":
+        if IS_WIN and target.get('scoped'):
+            # A tree-wide taskkill would cross registered child-card boundaries.
+            for pid in [p for p in target['members'] if p != ident] + [ident]:
+                ok, error = _win_stop_process(pid, tree=False, force=(sig == getattr(signal, 'SIGKILL', None)))
+                if not ok and pid_alive(pid):
+                    return False, error
+            return True, None
+        return stop_pid_tree(ident, sig)
+    if IS_WIN:
+        ok, error = _win_stop_process(
+            ident, tree=False,
+            force=(sig == getattr(signal, "SIGKILL", None)))
+        if ok or not pid_alive(ident):
+            return True, None
+        return False, error or "停止受控进程失败"
+    try:
+        os.kill(ident, sig)
+        return True, None
+    except ProcessLookupError:
+        return True, None
+    except PermissionError:
+        return False, "没有权限停止受控进程"
+    except OSError as e:
+        return False, "停止受控进程失败: %s" % e
+
+
+
+def force_windows_target(app):
+    """Quiesce an already owned tree before taking its final kill snapshot.
+
+    A one-shot snapshot misses children born between scanning and terminating the
+    launcher. Freeze verified parents first, refresh through the existing card
+    ownership resolver, and repeat until all current members are paused. Do not
+    traverse/kill raw descendants after the identity-bearing parent has died.
+    """
+    from win_metrics import SuspendedProcesses, terminate_verified
+    deadline = time.monotonic() + APP_STOP_TIMEOUT_SEC
+    try:
+        with SuspendedProcesses() as suspended:
+            while time.monotonic() < deadline:
+                table = _win_process_table(refresh=True)
+                target, error = resolve_app_stop_target(app)
+                if not target:
+                    return None, error
+                identities = {pid: table[pid]['identity'] for pid in target['members']
+                              if table.get(pid, {}).get('identity')}
+                if len(identities) != len(target['members']):
+                    return None, '部分进程身份不可读，未强制结束'
+                if any(pid == SELF_PID or process_uid(pid) != SELF_UID for pid in identities):
+                    return None, '进程所有者或控制台自身边界不符，未强制结束'
+                additions = [(pid, created) for pid, created in identities.items()
+                             if suspended.identities.get(pid) != created]
+                if additions:
+                    # Ancestors normally precede descendants in creation time.
+                    # The next verified snapshot catches any child born before
+                    # its parent was paused; registered child cards stay excluded.
+                    for pid, created in sorted(additions, key=lambda item: int(item[1])):
+                        suspended.add(pid, created)
+                    continue
+                if terminate_verified(identities):
+                    return None, '部分已验证进程无法强制结束，保留管理状态'
+                return target, None
+    except (OSError, AttributeError, ValueError):
+        LOG.exception('已验证进程的强制结束准备失败')
+        return None, '无法安全固定进程边界，未确认强制结束完成；请刷新状态后重试'
+    return None, '进程边界持续变化，未强制结束，请稍后重试'
+
+
+def stop_target_alive(target, expected_uid=None):
+    if IS_WIN:
+        # 树杀后的存活判定：任一成员（含锚点）仍在即可。
+        members = target.get("members") or []
+        if members:
+            return any(pid_alive(member) for member in members)
+        return pid_alive(target["id"])
+    if target["kind"] == "group":
+        try:
+            os.killpg(target["id"], 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return True
+    try:
+        os.kill(target["id"], 0)
+        if expected_uid is None:
+            expected_uid = process_uid(target["id"])
+        return expected_uid == SELF_UID
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+
+
+def stop_app_and_wait(app, timeout=APP_STOP_TIMEOUT_SEC, listeners=None):
+    """Signal a verified app and wait until the exact target is gone.
+
+    Returns (ok, error).  A timeout is deliberately not escalated to SIGKILL;
+    the caller keeps the runtime token so the user can retry or choose a force
+    action without losing control of a still-live process.
+    """
+    target, error = resolve_app_stop_target(app, listeners)
+    if target is None:
+        return False, error
+    ok, error = signal_app_stop(target)
+    if not ok:
+        return False, error
+    deadline = time.monotonic() + max(0.0, timeout)
+    # uid 只查一次：信号已在循环外发出，循环仅做存活探测，
+    # 避免 50ms 一次的 ps 子进程（PID 复用时最坏多等一个超时周期，无副作用）。
+    expected_uid = (process_uid(target["id"]) if target["kind"] == "pid"
+                    else None)
+    while stop_target_alive(target, expected_uid):
+        if time.monotonic() >= deadline:
+            remaining = (target["members"] if IS_WIN or target["kind"] == "pid"
+                         else _current_user_group_members(target["id"]))
+            suffix = "（PID %s）" % "、".join(str(p) for p in remaining) if remaining else ""
+            if IS_WIN:
+                from ops_entries import list_windows
+                members = set(managed_pids(app))
+                if any(w['pid'] in members and w.get('windowClass') == '#32770'
+                       and ('保存' in w['title'] or re.search(r'\bsave\b', w['title'], re.I))
+                       for w in list_windows(sys.modules[__name__])):
+                    return False, '需要保存：请先处理“%s”中的保存提示，再关闭应用' % app['name']
+            return False, "应用未在 %.1f 秒内退出%s，仍保留管理状态" % (timeout, suffix)
+        time.sleep(0.05)
+    return True, None
+
+
+def stop_app_and_clear(cfg, app, timeout=APP_STOP_TIMEOUT_SEC, listeners=None):
+    """Manual stop transaction: wait first, clear persisted identity last."""
+    marker = (app.get("id"), app.get("runToken"))
+    with MANUAL_STOP_LOCK:
+        MANUAL_STOP_TOKENS.add(marker)
+    try:
+        if app.get('stopAction'):
+            monitor = getattr(cfg, 'monitor', None)
+            if monitor is None:
+                return False, '动作执行器尚未就绪'
+            result = monitor.execute_action(app, app['stopAction'])
+            if not result.get('ok'):
+                return False, result.get('error', '退出操作失败')
+            deadline = time.monotonic() + timeout
+            while app_alive_sign(app) and time.monotonic() < deadline:
+                time.sleep(.1)
+            if app_alive_sign(app):
+                return False, '退出操作已执行，但应用仍在运行'
+            last_exit = {'status': 'stopped', 'code': None, 'at': int(time.time())} if app.get('kind') == 'task' else None
+            if not clear_app_runtime(cfg, app['id'], app.get('runToken'), last_exit=last_exit):
+                return False, '进程已停止，但应用状态已变化，请刷新后重试'
+            return True, None
+        ok, error = stop_app_and_wait(app, timeout, listeners)
+        if not ok:
+            return False, error
+        last_exit = None
+        if (app.get("kind") or "service") == "task":
+            # 覆盖可能保留的旧成功记录，避免“刚刚手动停止”仍显示上次成功。
+            last_exit = {
+                "status": "stopped",
+                "code": None,
+                "at": int(time.time()),
+            }
+        if not clear_app_runtime(
+                cfg, app["id"], app.get("runToken"), last_exit=last_exit):
+            return False, "进程已停止，但应用状态已变化，请刷新后重试"
+        return True, None
+    finally:
+        with MANUAL_STOP_LOCK:
+            MANUAL_STOP_TOKENS.discard(marker)
+
+
+def inspect_attach_process(cfg, app, pid):
+    """只读校验待认领进程，返回其可信工作目录。
+
+    创建卡片时先调用本函数，再把卡片与运行身份一次写入配置，避免前端
+    “先创建、再认领”只完成一半。已有卡片的手动认领也复用同一套校验。"""
+    if (app.get("kind") or "service") != "service":
+        return False, "批处理任务没有端口，无法认领进程", {"status": 422}
+    port = app.get("port")
+    if not isinstance(port, int) or port <= 0:
+        return False, "卡片未配置端口，无法认领进程", {"status": 422}
+    if app_alive_sign(app):
+        return False, "应用已在运行", {"status": 409}
+    if pid == os.getpid():
+        return False, "不能认领总控台自身", {"status": 409}
+    listeners = scan_listeners()
+    if (pid, port) not in listeners:
+        return False, "PID %d 并未监听端口 %d，进程可能已退出" % (pid, port), {"status": 409}
+    snap = ps_snapshot({pid}, with_uid=True)
+    if snap.get(pid, {}).get("uid") != SELF_UID:
+        return False, "该进程不属于当前用户，不能认领", {"status": 403}
+    cfg_now = cfg.snapshot()
+    owners = listener_app_owners(cfg_now.get("apps") or [], listeners, snap, None)
+    if pid in owners:
+        return False, "该进程已由卡片「%s」管理" % owners[pid].get("name", ""), {"status": 409}
+    actual_cwd = lsof_cwds({pid}).get(pid)
+    if not actual_cwd:
+        return False, (
+            "无法读取该进程的工作目录，不能自动认领。"
+            "请改为选择工作区后创建启动卡片。"
+        ), {"status": 409}
+    native_windows_path = bool(
+        IS_WIN and (
+            re.match(r"^[A-Za-z]:[\\/]", actual_cwd) or
+            actual_cwd.startswith("\\\\")
+        )
+    )
+    if native_windows_path and not os.path.isdir(actual_cwd):
+        return False, (
+            "该进程的工作目录已不存在：%s。"
+            "请重新选择工作区后创建启动卡片。" % actual_cwd
+        ), {"status": 409}
+    return True, None, {"status": 200, "cwd": actual_cwd}
+
+
+def attach_app_process(cfg, app_id, app, pid):
+    """把已在监听配置端口的当前用户进程认领为本卡片受管进程。
+
+    认领走旧版身份通道（lastPid + 监听端口 + 当前 UID + 真实 cwd 四重校验），
+    与卡片 cwd 不一致时原子同步卡片 cwd。认领后卡片显示运行中，可正常
+    停止/重启（重启后转为 token 受管）。返回 (ok, error, info)。"""
+    ok, error, identity = inspect_attach_process(cfg, app, pid)
+    if not ok:
+        return False, error, identity
+    actual_cwd = identity["cwd"]
+    cwd_updated = False
+    pid_conflict = False
+
+    def op(c):
+        nonlocal cwd_updated, pid_conflict
+        target = find_app(c, app_id)
+        if not target:
+            return False
+        # 认领检查与写入必须同锁：inspect 用的是旧快照，并发请求可能同时
+        # 通过校验。在写锁内重验 pid 是否已被其他卡片认领。
+        if any(other.get("lastPid") == pid
+               for other in c.get("apps") or [] if other.get("id") != app_id):
+            pid_conflict = True
+            return False
+        target["lastPid"] = pid
+        target["lastPgid"] = None
+        target["runToken"] = None
+        target["attached"] = True
+        target['expectedRunning'] = True
+        target['startedAt'] = time.time()
+        target["lastExit"] = None
+        try:
+            same = (isinstance(target.get("cwd"), str) and target["cwd"]
+                    and os.path.realpath(target["cwd"]) == os.path.realpath(actual_cwd))
+        except OSError:
+            same = False
+        if not same:
+            target["cwd"] = actual_cwd
+            cwd_updated = True
+        return True
+
+    if not cfg.update(op):
+        if pid_conflict:
+            return False, "该进程已由其他卡片管理", {"status": 409}
+        return False, "应用已被删除", {"status": 404}
+    info = {}
+    if cwd_updated:
+        info["cwdUpdated"] = True
+        info["cwd"] = actual_cwd
+    return True, None, info
+
+
+# ---------------------------------------------------------------- 日志
+
+def rotate_log_file(path, max_bytes=MAX_LOG_BYTES, backups=LOG_BACKUPS):
+    """超限后 copy-truncate，保持子进程已打开的文件描述符继续可写。"""
+    with LOG_LOCK:
+        try:
+            if os.path.getsize(path) <= max_bytes:
+                return False
+        except OSError:
+            return False
+        try:
+            for index in range(backups, 1, -1):
+                older = "%s.%d" % (path, index - 1)
+                newer = "%s.%d" % (path, index)
+                if os.path.exists(older):
+                    os.replace(older, newer)
+            shutil.copyfile(path, path + ".1")
+            os.chmod(path + ".1", 0o600)
+            with open(path, "r+b") as f:
+                f.truncate(0)
+            os.chmod(path, 0o600)
+            return True
+        except OSError:
+            LOG.exception("轮转日志失败: %s", path)
+            return False
+
+
+def _tail_file_lines(path, count, block_size=65536):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            pos = f.tell()
+            chunks = []
+            newlines = 0
+            while pos > 0 and newlines <= count:
+                size = min(block_size, pos)
+                pos -= size
+                f.seek(pos)
+                chunk = f.read(size)
+                if not chunk.strip(b"\x00"):
+                    break  # 空洞/被外部截断后残留的 NUL 段：之前没有内容，停止回扫
+                chunks.append(chunk)
+                newlines += chunk.count(b"\n")
+        data = b"".join(reversed(chunks))
+        return data.decode("utf-8", errors="replace").splitlines()[-count:]
+    except OSError:
+        return []
+
+
+def read_log_tail(app_id, count):
+    """从当前日志和轮转备份中高效读取最后 count 行。"""
+    path = os.path.join(LOGS_DIR, "%s.log" % app_id)
+    rotate_log_file(path)
+    collected = []
+    with LOG_LOCK:
+        for candidate in [path] + ["%s.%d" % (path, i)
+                                   for i in range(1, LOG_BACKUPS + 1)]:
+            remaining = count - len(collected)
+            if remaining <= 0:
+                break
+            lines = _tail_file_lines(candidate, remaining)
+            collected = lines + collected
+    return "\n".join(collected[-count:])
+
+
+def start_log_maintenance():
+    def _maintain():
+        while True:
+            try:
+                for name in os.listdir(LOGS_DIR):
+                    if name.endswith(".log"):
+                        rotate_log_file(os.path.join(LOGS_DIR, name))
+            except OSError:
+                LOG.exception("日志维护失败")
+            time.sleep(LOG_MAINTENANCE_SEC)
+    threading.Thread(target=_maintain, daemon=True).start()
+
+
+def sniff_image(data):
+    """magic bytes 校验 → "png" / "jpg" / "webp" / None。"""
+    if len(data) >= 8 and data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if len(data) >= 3 and data[:3] == b"\xff\xd8\xff":
+        return "jpg"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
+# ---------------------------------------------------------------- 站点图标抓取
+
+ICON_LINK_RE = re.compile(
+    r"<link[^>]+rel=[\"'][^\"']*icon[^\"']*[\"'][^>]*>", re.I)
+HREF_RE = re.compile(r"href=[\"']([^\"']+)[\"']", re.I)
+
+
+def is_loopback_service_url(url, port):
+    """仅允许抓取指定端口的明文 loopback URL，避免 favicon SSRF。"""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        return (parsed.scheme == "http"
+                and (parsed.hostname or "").lower() in (
+                    "127.0.0.1", "localhost", "::1")
+                and parsed.port == port
+                and not parsed.username and not parsed.password)
+    except (TypeError, ValueError, UnicodeError):
+        return False
+
+
+class LoopbackRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """只跟随仍停留在同一 loopback 端口的重定向。"""
+
+    def __init__(self, port):
+        super().__init__()
+        self.port = port
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not is_loopback_service_url(newurl, self.port):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def http_get(url, port, timeout=3, limit=262144):
+    """GET → (bytes, content-type) | (None, None)。仅抓同一 loopback 端口。"""
+    if not is_loopback_service_url(url, port):
+        return None, None
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "Console/1.0", "Accept": "*/*"})
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), LoopbackRedirectHandler(port))
+        with opener.open(req, timeout=timeout) as r:
+            return r.read(limit), (r.headers.get("Content-Type") or "")
+    except Exception:
+        return None, None
+
+
+def extract_app_exe_icon(app):
+    """Read the configured desktop EXE's icon without launching the application."""
+    if not IS_WIN or app.get('kind') != 'desktop':
+        return None
+    path = ((app.get('externalIdentity') or {}).get('exe') or
+            (app.get('instanceMatch') or {}).get('exe'))
+    if not path or not os.path.isfile(path):
+        tokens = _simple_command_tokens(app.get('command'))
+        if not tokens:
+            return None
+        path = _resolve_command_path(tokens[0], app.get('cwd') or os.getcwd())
+        if not os.path.isfile(path):
+            path = shutil.which(tokens[0])
+    if not path or not os.path.isfile(path) or not path.lower().endswith('.exe'):
+        return None
+    if os.path.basename(path).lower() in ('python.exe', 'pythonw.exe', 'node.exe', 'cmd.exe', 'powershell.exe', 'pwsh.exe'):
+        return None
+    literal = "'" + path.replace("'", "''") + "'"
+    encoded = _win_powershell("""
+Add-Type -AssemblyName System.Drawing
+$icon = [System.Drawing.Icon]::ExtractAssociatedIcon(%s)
+if ($null -ne $icon) {
+    try {
+        $bitmap = $icon.ToBitmap()
+        try {
+            $stream = New-Object System.IO.MemoryStream
+            try {
+                $bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
+                [Convert]::ToBase64String($stream.ToArray())
+            } finally { $stream.Dispose() }
+        } finally { $bitmap.Dispose() }
+    } finally { $icon.Dispose() }
+}
+""" % literal, timeout=15)
+    try:
+        raw = base64.b64decode(encoded.strip(), validate=True)
+        return raw if sniff_image(raw) == 'png' else None
+    except ValueError:
+        return None
+
+
+def sniff_icon_bytes(data, ctype=""):
+    """→ "png" / "jpg" / "webp" / "ico" / None。拒绝主动 SVG 内容。"""
+    if len(data) >= 4 and data[:4] == b"\x00\x00\x01\x00":
+        return "ico"
+    ext = sniff_image(data)
+    if ext:
+        return ext
+    return None
+
+
+def fetch_favicon(port, host="127.0.0.1"):
+    """抓本地站点图标 → (bytes, ext) | (None, None)。
+    先解析首页 <link rel=...icon...>（含 apple-touch-icon），兜底 /favicon.ico。"""
+    if host not in ("127.0.0.1", "localhost"):
+        host = "127.0.0.1"
+    base = "http://%s:%d" % (host, port)
+    candidates = []
+    html, _ = http_get(base + "/", port)
+    if html:
+        text = html.decode("utf-8", errors="replace")
+        for m in ICON_LINK_RE.finditer(text):
+            hm = HREF_RE.search(m.group(0))
+            if hm:
+                url = urllib.parse.urljoin(base + "/", hm.group(1))
+                if is_loopback_service_url(url, port):
+                    candidates.append(url)
+    candidates.append(base + "/favicon.ico")
+    for url in candidates[:4]:
+        data, ctype = http_get(url, port, limit=1024 * 1024)
+        if data:
+            ext = sniff_icon_bytes(data, ctype)
+            if ext:
+                return data, ext
+    return None, None
+
+
+def find_app(cfg, app_id):
+    for app in cfg.get("apps") or []:
+        if app.get("id") == app_id:
+            return app
+    return None
+
+
+def diagnose_app(cfg, app):
+    """规则诊断：退出码 + 日志模式 + 文件系统检查 → 可执行的修复建议列表。
+
+    覆盖常见失败：依赖未装、命令/脚本不存在、运行时缺失、npm 脚本名错误、
+    端口占用、权限不足、Python 包缺失。
+    """
+    issues = []
+
+    def add(kind, title, detail, fix, action=None):
+        if not any(i["kind"] == kind for i in issues):
+            issue = {"kind": kind, "title": title,
+                     "detail": detail, "fix": fix}
+            if action:
+                issue["action"] = action
+            issues.append(issue)
+
+    app_id = app.get("id") or ""
+    cwd = app.get("cwd") or ""
+    last_exit = app.get("lastExit") or {}
+    code = last_exit.get("code")
+    port = app.get("port")
+    log_tail = read_log_tail(app_id, 150) if app_id else ""
+    log_lower = log_tail.lower()
+
+    # ---- 配置层检查（不依赖日志） ----
+    for health_issue in inspect_app_health(app).get("issues", []):
+        add(
+            health_issue["kind"],
+            health_issue["title"],
+            health_issue["detail"],
+            health_issue["fix"],
+            health_issue.get("action"),
+        )
+
+    pkg_json = os.path.join(cwd, "package.json") if cwd else ""
+    has_pkg = bool(cwd) and os.path.isfile(pkg_json)
+    has_node_modules = bool(cwd) and os.path.isdir(os.path.join(cwd, "node_modules"))
+    if has_pkg and not has_node_modules:
+        mgr = ("yarn" if os.path.isfile(os.path.join(cwd, "yarn.lock"))
+               else "pnpm" if os.path.isfile(os.path.join(cwd, "pnpm-lock.yaml"))
+               else "npm")
+        add("deps-missing", "依赖未安装（node_modules 缺失）",
+            "目录里有 package.json，但没有 node_modules。",
+            "终端执行：cd \"%s\" && %s install，装完再启动。" % (cwd, mgr))
+
+    # ---- 日志模式匹配 ----
+    m = re.search(r"cannot find module '([^']+)'", log_lower)
+    if m:
+        add("deps-missing", "找不到模块 %s" % m.group(1),
+            "日志报 Cannot find module '%s'，通常是依赖没装或装坏了。" % m.group(1),
+            "终端执行：cd \"%s\" && npm install（仍报错再 rm -rf node_modules 后重装）。" % (cwd or "<项目目录>"))
+
+    m = re.search(r"(?:env: )?(\S+): (?:no such file or directory|command not found)", log_lower)
+    if m and "cannot find module" not in log_lower:
+        add("runtime-missing", "找不到运行时：%s" % m.group(1),
+            "系统里找不到 %s 这个命令。" % m.group(1),
+            "确认该运行时已安装（如 node / python3 / pnpm）；总控台启动时会补常见 PATH，但程序本身需要存在。")
+
+    if "missing script" in log_lower and has_pkg:
+        script_names = []
+        try:
+            with open(pkg_json, "r", encoding="utf-8") as f:
+                script_names = list((json.load(f).get("scripts") or {}).keys())
+        except Exception:
+            pass
+        hint = ("package.json 里可用的脚本：%s。" % "、".join(script_names)
+                if script_names else "package.json 里没有 scripts。")
+        add("npm-script", "npm 脚本名写错了",
+            "日志报 missing script。%s" % hint,
+            "把启动命令改成上面列出的脚本名，例如 npm run %s。" % (script_names[0] if script_names else "dev"))
+
+    if "eaddrinuse" in log_lower or "address already in use" in log_lower:
+        add("port-busy", "端口被占用",
+            "日志报地址已占用%s。" % ("（:%s）" % port if port else ""),
+            "点卡片上的端口数字看是谁占用的，停掉它或给本应用换个端口。")
+
+    if "eacces" in log_lower or "permission denied" in log_lower:
+        add("perm", "权限不足",
+            "日志报权限不足（EACCES / permission denied）。",
+            "检查文件/目录权限；脚本需要可执行权限：chmod +x <脚本>。不要简单用 sudo 运行。")
+
+    m = re.search(r"modulenotfounderror: no module named '([^']+)'", log_lower)
+    if m:
+        add("pip-missing", "缺少 Python 包：%s" % m.group(1),
+            "日志报 ModuleNotFoundError: No module named '%s'。" % m.group(1),
+            "建议在项目目录建虚拟环境再装：python3 -m venv .venv && .venv/bin/pip install %s" % m.group(1))
+
+    if re.search(r"no such file or directory", log_lower) and not issues:
+        add("file-missing", "命令里的文件/脚本不存在",
+            "日志报 No such file or directory，命令里引用的路径可能写错了。",
+            "检查启动命令和工作目录里的相对路径是否正确。")
+
+    # ---- 退出码兜底 ----
+    if not issues:
+        if code == 126:
+            add("not-exec", "命令没有执行权限（exit 126）",
+                "退出码 126 表示文件不可执行。",
+                "给脚本加执行权限：chmod +x <脚本>，或用 bash <脚本> 启动。")
+        elif code == 127:
+            add("not-found", "命令不存在（exit 127）",
+                "退出码 127 表示 shell 找不到这个命令。",
+                "确认命令已安装且在 PATH 里；总控台会补常见路径，但程序本身要存在。")
+        elif (isinstance(code, int) and code == 0
+              and (app.get("kind") or "service") != "task"):
+            add("quick-exit", "命令立即正常退出（exit 0）",
+                "进程启动后马上正常结束——长期服务命令不应立刻退出。",
+                "确认写的是常驻命令（如 hexo s / npm run dev），而不是一次就完成的命令。")
+        elif isinstance(code, int) and code < 0:
+            add("signaled", "进程被信号终止（signal %d）" % -code,
+                "进程不是自然退出，是被系统信号杀掉的。",
+                "常见于内存不足被系统回收或外部 kill；查看系统日志确认原因。")
+
+    # ---- 汇总 ----
+    if issues:
+        summary = "发现 %d 个可能原因，按「修复建议」处理后再启动。" % len(issues)
+    elif not log_tail.strip():
+        summary = "暂无日志可供诊断；先启动一次让日志产生，再看完整日志定位。"
+    elif code is None:
+        summary = "该应用还没有退出记录；当前日志未见明显异常。"
+    else:
+        summary = "日志里没有命中常见错误模式，建议打开完整日志人工排查。"
+    return {"ok": True, "issues": issues, "summary": summary}
+
+
+def validate_port(value):
+    """→ (port|None, error|None)。接受 null / 整数 / 数字字符串，范围 1-65535。"""
+    if value is None or value == "":
+        return None, None
+    if isinstance(value, bool):
+        return None, "port 必须是 1-65535 的整数"
+    if isinstance(value, int):
+        port = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        port = int(value.strip())
+    else:
+        return None, "port 必须是 1-65535 的整数"
+    if not (1 <= port <= 65535):
+        return None, "port 必须在 1-65535 之间"
+    return port, None
+
+
+def validate_app_fields(data, partial):
+    """校验/规范化应用字段。partial=True 时仅校验出现的字段。
+    返回 (fields, error)：fields 为规范化后的字段子集。"""
+    fields = {}
+    if "shell" in data:
+        allowed = ("cmd", "powershell") if IS_WIN else ("bash",)
+        if data["shell"] not in allowed:
+            return None, "shell 必须是 " + "/".join(allowed)
+        fields["shell"] = data["shell"]
+    elif not partial:
+        fields["shell"] = "cmd" if IS_WIN else "bash"
+    for key in ("name", "command"):
+        if key in data:
+            v = data[key]
+            if not isinstance(v, str) or (key == 'name' and not v.strip()):
+                return None, "字段 %s 必须是非空字符串" % key
+            fields[key] = v.strip()
+        elif not partial:
+            return None, "缺少字段 %s" % key
+    if "cwd" in data:
+        v = data["cwd"]
+        if v is not None and not isinstance(v, str):
+            return None, "cwd 必须是字符串或 null"
+        fields["cwd"] = (v or "").strip() or None if isinstance(v, str) else None
+    elif not partial:
+        fields["cwd"] = None
+    if "port" in data:
+        port, err = validate_port(data["port"])
+        if err:
+            return None, err
+        fields["port"] = port
+    elif not partial:
+        fields["port"] = None
+    if "emoji" in data:
+        v = data["emoji"]
+        if v is not None and not isinstance(v, str):
+            return None, "emoji 必须是字符串或 null"
+        fields["emoji"] = (v or None)
+    elif not partial:
+        fields["emoji"] = None
+    if "glyph" in data:
+        v = data["glyph"]
+        if v is not None and (not isinstance(v, str) or len(v) > 40):
+            return None, "glyph 必须是字符串或 null"
+        fields["glyph"] = (v or None)
+    elif not partial:
+        fields["glyph"] = None
+    if "kind" in data:
+        if data["kind"] not in ("service", "task", "desktop"):
+            return None, "kind 必须是 service/task/desktop"
+        fields["kind"] = data["kind"]
+    elif not partial:
+        fields["kind"] = "service"
+    if fields.get("kind") == "task":
+        fields["port"] = None  # 批处理任务无端口语义
+    try:
+        fields.update(validate_app_extra(data))
+        allowed = ('cmd', 'powershell') if IS_WIN else ('bash',)
+        if any(a['type'] == 'command' and a['shell'] not in allowed for a in fields.get('actions', [])):
+            raise ValueError('操作解释器必须是 '+'/'.join(allowed))
+        if not partial:
+            validate_stop_action(fields)
+    except ValueError as exc:
+        return None, str(exc)
+    return fields, None
+
+
+def operate_app(cfg, app, operation, force=False):
+    """One lifecycle path for individual controls and preset execution."""
+    from ops_entries import refresh_instance
+    app, match_error = refresh_instance(sys.modules[__name__], cfg, app)
+    if match_error:
+        return {'ok': False, 'error': match_error}, 409
+    running = app_alive_sign(app)
+    if not running and app_identity_uncertain(app):
+        return {'ok': False, 'error': '运行身份无法确认，请刷新或重新关联，未执行操作'}, 409
+    if operation in ('start', 'restart'):
+        background = running and desktop_background_only(app)
+        if operation == 'start' and running and not background:
+            return {'ok': False, 'error': '应用已在运行'}, 409
+        health = inspect_app_health(app)
+        if health['blocking']:
+            error = health['issues'][0]['title']
+            if operation == 'restart':
+                error += '。旧服务仍在运行'
+            return {'ok': False, 'error': error, 'health': health}, 422
+        if operation == 'start' and background:
+            # Ask the existing singleton to show a window. Do not replace its
+            # managed identity with this short-lived invocation's PID/token.
+            args = _simple_command_tokens(app['command'])
+            if not args or os.path.basename(args[0]).lower() not in ('chrome.exe', 'msedge.exe'):
+                # Codex Deck is a shortcut/launcher. Keep its configured launch
+                # command and the original desktop identity, not a terminal PID.
+                ok, error, proc, _, _ = start_app(app)
+                if not ok:
+                    return {'ok': False, 'error': error}, 500
+                threading.Thread(target=proc.wait, daemon=True, name='desktop-show').start()
+                return {'ok': True, 'reopened': True}, 200
+            args.append('--new-window')
+            try:
+                proc = subprocess.Popen(args, cwd=app.get('cwd') or None,
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=independent_windows_flags())
+            except OSError as exc:
+                return {'ok': False, 'error': '打开应用界面失败：' + str(exc)}, 500
+            threading.Thread(target=proc.wait, daemon=True, name='desktop-show').start()
+            return {'ok': True, 'reopened': True}, 200
+    if operation in ('stop', 'restart'):
+        if not running:
+            return {'ok': False, 'error': '应用未在运行'}, 409
+        if force:
+            target, error = resolve_app_stop_target(app)
+            if not target:
+                return {'ok': False, 'error': error}, 409
+            marker = (app['id'], app.get('runToken'))
+            with MANUAL_STOP_LOCK:
+                MANUAL_STOP_TOKENS.add(marker)
+            try:
+                if IS_WIN:
+                    target, error = force_windows_target(app)
+                    if not target:
+                        return {'ok': False, 'error': error}, 409
+                    ok, error = True, None
+                else:
+                    ok, error = signal_app_stop(target, signal.SIGKILL)
+                if not ok:
+                    return {'ok': False, 'error': error}, 409
+                deadline = time.monotonic()+APP_STOP_TIMEOUT_SEC
+                while stop_target_alive(target) and time.monotonic() < deadline:
+                    time.sleep(.05)
+                if stop_target_alive(target):
+                    return {'ok': False, 'error': '进程尚未退出，保留管理状态'}, 409
+                last_exit = {'status': 'stopped', 'code': None, 'at': int(time.time())} if app.get('kind') == 'task' else None
+                clear_app_runtime(cfg, app['id'], app.get('runToken'), last_exit)
+            finally:
+                with MANUAL_STOP_LOCK:
+                    MANUAL_STOP_TOKENS.discard(marker)
+        else:
+            ok, error = stop_app_and_clear(cfg, app)
+            if not ok:
+                return {'ok': False, 'error': error}, 409
+        if operation == 'stop':
+            return {'ok': True}, 200
+        app = find_app(cfg.snapshot(), app['id'])
+    port = app.get('port')
+    occupied = [(pid, p) for pid, p in scan_listeners() if p == port] if port else []
+    if occupied:
+        return {'ok': False, 'error': '端口 %d 已被 PID %d 占用' % (port, occupied[0][0])}, 409
+    ok, error, proc, pgid, token = start_app(app)
+    if not ok:
+        return {'ok': False, 'error': error}, 500
+    try:
+        saved = persist_started_app(cfg, app['id'], proc, pgid, token)
+    except Exception:
+        stop_pid_tree(pgid, force=True)
+        raise
+    if not saved:
+        stop_pid_tree(pgid, force=True)
+        return {'ok': False, 'error': '应用已被删除，已取消启动'}, 409
+    if app.get('kind') == 'service':
+        deadline = time.monotonic()+STARTUP_PROBE_SEC
+        while proc.poll() is None and time.monotonic() < deadline:
+            time.sleep(.025)
+        if proc.poll() is not None:
+            return {'ok': False, 'error': startup_failure_message(app['id'], proc.returncode)}, 422
+    return {'ok': True, 'pid': proc.pid}, 200
+
+
+# ---------------------------------------------------------------- HTTP 处理
+
+def serialized_app_operation(fn):
+    """Reject overlapping mutations for one app instead of racing/queueing."""
+    @functools.wraps(fn)
+    def wrapped(self, app_id, *args, **kwargs):
+        lock = self.server.try_app_operation(app_id)
+        if lock is None:
+            self.send_err(409, "该应用正在执行其他操作，请稍后重试")
+            return None
+        try:
+            return fn(self, app_id, *args, **kwargs)
+        finally:
+            lock.release()
+    return wrapped
+
+
+class ConsoleServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, addr, handler_cls, cfg, port):
+        global _PROCESS_CONFIG
+        super().__init__(addr, handler_cls)
+        self.cfg = cfg
+        _PROCESS_CONFIG = cfg
+        self.console_port = self.server_address[1]
+        self.control_token = secrets.token_urlsafe(32)
+        self._app_locks = {}
+        self._app_locks_guard = threading.Lock()
+        self._console_action_guard = threading.Lock()
+        self._console_action = None
+        self._console_helper_pid = None
+
+    def handle_error(self, request, client_address):
+        """空闲连接超时 / 客户端中途断开属正常现象，不刷 traceback。"""
+        exc_type, exc, _ = sys.exc_info()
+        if exc_type and isinstance(exc, (TimeoutError, BrokenPipeError,
+                                         ConnectionResetError,
+                                         ConnectionAbortedError)):
+            return
+        super().handle_error(request, client_address)
+
+    def try_app_operation(self, app_id):
+        with self._app_locks_guard:
+            lock = self._app_locks.setdefault(app_id, threading.Lock())
+        return lock if lock.acquire(blocking=False) else None
+
+    def forget_app_lock(self, app_id):
+        """应用删除后回收其操作锁（调用方应已持有该锁）。"""
+        with self._app_locks_guard:
+            self._app_locks.pop(app_id, None)
+
+    def reserve_console_action(self, action):
+        with self._console_action_guard:
+            if self._console_action is not None:
+                return False, self._console_action, self._console_helper_pid
+            self._console_action = action
+            return True, action, None
+
+    def set_console_helper_pid(self, pid):
+        with self._console_action_guard:
+            self._console_helper_pid = pid
+
+    def release_console_action(self, action):
+        with self._console_action_guard:
+            if self._console_action == action:
+                self._console_action = None
+                self._console_helper_pid = None
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "Console/%s" % APP_VERSION
+    # 每连接 socket 超时：慢速/谎报 Content-Length 的客户端无法无限占住
+    # 线程（默认 None 会永久阻塞 rfile.read）；空闲 keep-alive 连接也会回收。
+    SOCKET_TIMEOUT_SEC = 30.0
+
+    def setup(self):
+        super().setup()
+        try:
+            self.connection.settimeout(self.SOCKET_TIMEOUT_SEC)
+        except OSError:
+            pass
+
+    # ---------- 基础工具 ----------
+
+    def log_request(self, code="-", size="-"):
+        # 成功读取（含日志轮询）和自动取图标不写访问日志；失败与操作仍保留。
+        path = getattr(self, 'path', '').split('?', 1)[0]
+        if str(code).isdigit() and 200 <= int(code) < 400:
+            if self.command in ("GET", "HEAD") or (
+                    self.command == "POST" and
+                    re.fullmatch(r"/api/apps/[^/]+/favicon", path)):
+                return
+        super().log_request(code, size)
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("%s - %s\n" % (self.client_address[0], fmt % args))
+
+    def _parsed_request_host(self):
+        """Return (hostname, port) only for the exact local console origin."""
+        raw = (self.headers.get("Host") or "").strip()
+        if not raw or any(ch in raw for ch in "\r\n,@/"):
+            return None
+        try:
+            parsed = urllib.parse.urlsplit("http://" + raw)
+            hostname = (parsed.hostname or "").lower()
+            port = parsed.port
+        except (ValueError, UnicodeError):
+            return None
+        if hostname not in ("127.0.0.1", "localhost", "::1"):
+            return None
+        if port != self.server.console_port:
+            return None
+        return hostname, port
+
+    def _request_host_allowed(self):
+        if self._parsed_request_host() is None:
+            return False
+        try:
+            return self.client_address[0] in ("127.0.0.1", "::1")
+        except (AttributeError, IndexError):
+            return False
+
+    def _same_origin(self, origin, host):
+        try:
+            parsed = urllib.parse.urlsplit(origin)
+            port = parsed.port or (80 if parsed.scheme == "http" else 443)
+            return (parsed.scheme == "http"
+                    and (parsed.hostname or "").lower() == host[0]
+                    and port == host[1]
+                    and not parsed.username and not parsed.password
+                    and not parsed.path and not parsed.query and not parsed.fragment)
+        except (ValueError, UnicodeError):
+            return False
+
+    def _has_control_cookie(self):
+        try:
+            cookie = SimpleCookie()
+            cookie.load(self.headers.get("Cookie") or "")
+            morsel = cookie.get("console_session")
+            return bool(morsel and secrets.compare_digest(
+                morsel.value, self.server.control_token))
+        except (KeyError, TypeError, ValueError):
+            return False
+
+    def _deny_request(self, status, message):
+        # Do not consume attacker-controlled bodies. Closing after the bounded
+        # JSON error prevents keep-alive request smuggling via leftover bytes.
+        self.close_connection = True
+        self.send_err(status, message)
+        try:
+            self.wfile.flush()
+        except OSError:
+            pass
+        # Windows：closesocket() 在接收缓冲区仍有未读数据时会发 RST，
+        # 客户端可能读不到拒绝响应。先尽力消费已到达的请求体（不阻塞等待，
+        # 防止被攻击者拖住线程），再半关闭丢弃其余，最后正常 FIN。
+        try:
+            self.connection.setblocking(False)
+            while True:
+                try:
+                    chunk = self.connection.recv(65536)
+                    if not chunk:
+                        break
+                except (BlockingIOError, InterruptedError):
+                    break
+                except OSError:
+                    break
+        except OSError:
+            pass
+        finally:
+            try:
+                self.connection.setblocking(True)
+            except OSError:
+                pass
+        try:
+            self.connection.shutdown(socket.SHUT_RD)
+        except OSError:
+            pass
+        return False
+
+    def _handle_request_error(self, method, exc):
+        """请求处理异常统一入口：细节只进日志，响应不回内部信息。"""
+        LOG.exception("%s %s 处理失败", method, self.path)
+        try:
+            self.send_err(500, "服务器错误")
+        except Exception:
+            pass
+
+    def authorize_request(self, mutating=False, content_kind=None):
+        """Enforce the loopback browser trust boundary.
+
+        Browser writes require exact same-origin metadata plus the HttpOnly
+        session cookie issued by this process. Headerless local CLI clients stay
+        compatible, but JSON/image Content-Type rules keep those paths
+        unavailable to simple cross-site HTML forms.
+        """
+        host = self._parsed_request_host()
+        if host is None or not self._request_host_allowed():
+            return self._deny_request(421, "请求 Host 不是当前本地控制台")
+        if not mutating:
+            return True
+
+        site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+        origin = (self.headers.get("Origin") or "").strip()
+        if site and site not in ("same-origin", "none"):
+            return self._deny_request(403, "拒绝跨站控制请求")
+        if origin and not self._same_origin(origin, host):
+            return self._deny_request(403, "请求 Origin 不是当前控制台")
+        if (site or origin) and not self._has_control_cookie():
+            return self._deny_request(403, "控制会话已失效，请刷新页面")
+
+        if self.headers.get("Transfer-Encoding"):
+            return self._deny_request(400, "不支持 Transfer-Encoding 请求体")
+
+        media_type = (self.headers.get("Content-Type") or "").split(";", 1)[0]
+        media_type = media_type.strip().lower()
+        if content_kind == "json" and media_type != "application/json":
+            return self._deny_request(415, "接口仅接受 application/json")
+        if content_kind == "image" and media_type not in (
+                "image/png", "image/jpeg", "image/webp",
+                "application/octet-stream"):
+            return self._deny_request(415, "图片接口仅接受 PNG/JPEG/WebP 原始数据")
+        if content_kind:
+            lengths = self.headers.get_all("Content-Length") or []
+            if len(lengths) != 1:
+                return self._deny_request(400, "请求必须包含唯一的 Content-Length")
+            try:
+                length = int(lengths[0])
+            except ValueError:
+                return self._deny_request(400, "非法的 Content-Length")
+            limit = MAX_ICON_BYTES if content_kind == "image" else MAX_JSON_BYTES
+            if length < 0 or length > limit:
+                return self._deny_request(413, "请求体过大")
+        return True
+
+    def _send(self, body, status=200, ctype="text/plain; charset=utf-8",
+              set_cookie=True):
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; "
+            "form-action 'self'; connect-src 'self'; img-src 'self' data: blob:; "
+            "font-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'")
+        if set_cookie and self._request_host_allowed():
+            self.send_header(
+                "Set-Cookie",
+                "console_session=%s; Path=/; HttpOnly; SameSite=Strict" %
+                self.server.control_token)
+        self.end_headers()
+        if body:
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError,
+                    ConnectionAbortedError):
+                pass
+
+    def send_json(self, obj, status=200):
+        self._send(json.dumps(obj, ensure_ascii=False).encode("utf-8"),
+                   status, "application/json; charset=utf-8")
+
+    def send_err(self, status, msg):
+        self.send_json({"ok": False, "error": msg}, status)
+
+    def discard_body(self):
+        """读掉并丢弃请求体。keep-alive 连接复用前必须清空，
+        否则残留字节会污染同一连接上的下一个请求（method 解析错乱 → 501）。"""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length > 0:
+            try:
+                self.rfile.read(length)
+            except OSError:
+                pass
+
+    def read_json_body(self):
+        """→ (data|None, error|None)。非法 JSON / 非对象 / 超限都返回 error。"""
+        media_type = (self.headers.get("Content-Type") or "").split(";", 1)[0]
+        if media_type.strip().lower() != "application/json":
+            return None, "Content-Type 必须是 application/json"
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return None, "非法的 Content-Length"
+        if length < 0 or length > MAX_JSON_BYTES:
+            return None, "请求体过大"
+        raw = self.rfile.read(length) if length else b""
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except Exception:
+            return None, "请求体不是合法 JSON"
+        if not isinstance(data, dict):
+            return None, "请求体必须是 JSON 对象"
+        return data, None
+
+    def _get_app_or_404(self, app_id):
+        cfg = self.server.cfg.snapshot()
+        app = find_app(cfg, app_id)
+        if app is None:
+            self.send_err(404, "应用不存在")
+            return None, None
+        return cfg, app
+
+    # ---------- GET ----------
+
+    def do_GET(self):
+        try:
+            if not self.authorize_request():
+                return
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path
+            if path == "/favicon.ico":
+                self.serve_static("/assets/favicon.ico")
+                return
+            if path == "/api/health":
+                self.send_json(build_health(self.server.cfg))
+                return
+            if path == "/api/ui/wallpaper":
+                self.handle_wallpaper_get()
+                return
+            if path == "/api/state":
+                self.send_json(get_state_snapshot(self.server.cfg,
+                                                  self.server.console_port))
+                return
+            if path.startswith('/api/ops/'):
+                from ops_api import get
+                get(self, path, parsed.query)
+                return
+            if path.startswith('/api/files/'):
+                from file_tools import handle
+                handle(self, path, 'GET')
+                return
+            if path == "/api/console/log":
+                self.handle_console_log(parsed.query)
+                return
+            m = APP_ROUTE_RE.match(path)
+            if m and m.group(2) == "logs":
+                self.handle_logs(m.group(1), parsed.query)
+                return
+            if path.startswith("/api/"):
+                self.send_err(404, "接口不存在")
+                return
+            if path.startswith("/icons/"):
+                self.serve_icon(path)
+                return
+            self.serve_static(path)
+        except (BrokenPipeError, ConnectionResetError,
+                ConnectionAbortedError):
+            pass
+        except Exception as e:
+            self._handle_request_error("GET", e)
+
+    def serve_static(self, path):
+        rel = urllib.parse.unquote(path).lstrip("/") or "index.html"
+        full = os.path.normpath(os.path.join(STATIC_DIR, rel))
+        # realpath 解析后必须仍在 STATIC_DIR 内，防路径穿越与符号链接逃逸。
+        try:
+            inside = os.path.commonpath(
+                [os.path.realpath(STATIC_DIR), os.path.realpath(full)]
+            ) == os.path.realpath(STATIC_DIR)
+        except (ValueError, OSError):
+            inside = False
+        if not inside or not os.path.isfile(full):
+            if rel == "index.html":
+                self._send(PLACEHOLDER_HTML.encode("utf-8"), 200,
+                           "text/html; charset=utf-8")
+            else:
+                self._send(b"404 Not Found", 404, set_cookie=False)
+            return
+        ctype = STATIC_TYPES.get(os.path.splitext(full)[1].lower(),
+                                 "application/octet-stream")
+        try:
+            with open(full, "rb") as f:
+                data = f.read()
+        except OSError:
+            self._send(b"404 Not Found", 404, set_cookie=False)
+            return
+        if rel == "index.html":
+            selected = self.server.cfg.snapshot().get("uiTheme", DEFAULT_UI_THEME)
+            theme = next((item for item in list_themes() if item["id"] == selected),
+                         {"id": DEFAULT_UI_THEME})
+            theme_id = theme["id"]
+            css = theme.get("css", "/themes/" + theme_id + ".css")
+            data = data.replace(b'data-ui-theme="ops"',
+                                ('data-ui-theme="' + theme_id + '"').encode(), 1)
+            data = data.replace(b'href="/themes/ops.css" id="themeCss"',
+                                ('href="' + css + '" id="themeCss"').encode(), 1)
+        self._send(data, 200, ctype, set_cookie=False)
+
+    def serve_icon(self, path):
+        name = os.path.basename(urllib.parse.unquote(path[len("/icons/"):]))
+        ext = os.path.splitext(name)[1].lower()
+        if ext not in ICON_EXTS:
+            self._send(b"404 Not Found", 404)
+            return
+        full = os.path.join(ICONS_DIR, name)
+        if not os.path.isfile(full):
+            self._send(b"404 Not Found", 404, set_cookie=False)
+            return
+        ctype = STATIC_TYPES.get(ext, "application/octet-stream")
+        try:
+            with open(full, "rb") as f:
+                data = f.read()
+        except OSError:
+            self._send(b"404 Not Found", 404, set_cookie=False)
+            return
+        self._send(data, 200, ctype, set_cookie=False)
+
+    def handle_logs(self, app_id, query):
+        _, app = self._get_app_or_404(app_id)
+        if app is None:
+            return
+        tail = self._parse_log_tail(query)
+        self.send_json({"text": read_log_tail(app_id, tail)})
+
+    def handle_console_log(self, query):
+        """总控台自身日志（data/logs/console.log），与维护线程共用轮转。"""
+        tail = self._parse_log_tail(query)
+        self.send_json({"text": read_log_tail("console", tail)})
+
+    @staticmethod
+    def _parse_log_tail(query, default=300):
+        try:
+            tail = int(urllib.parse.parse_qs(query).get("tail", [default])[0])
+        except (ValueError, IndexError):
+            tail = default
+        return max(1, min(tail, 5000))
+
+    # ---------- POST ----------
+
+    def do_POST(self):
+        try:
+            path = urllib.parse.urlparse(self.path).path
+            route_match = APP_ROUTE_RE.match(path)
+            content_kind = ("image" if path == "/api/ui/wallpaper" or
+                            (route_match and route_match.group(2) == "icon") else "json")
+            if not self.authorize_request(mutating=True,
+                                          content_kind=content_kind):
+                return
+            if path.startswith('/api/ops/'):
+                from ops_api import post
+                post(self, path)
+                return
+            if path.startswith('/api/files/'):
+                from file_tools import handle
+                handle(self, path, 'POST')
+                return
+            if path == "/api/kill":
+                self.handle_kill()
+                return
+            if path == "/api/services/flag":
+                self.handle_flag()
+                return
+            if path == "/api/watch":
+                self.handle_watch()
+                return
+            if path == "/api/ui/theme":
+                self.handle_ui_theme()
+                return
+            if path in ("/api/ui/wallpaper", "/api/ui/wallpaper/reset"):
+                self.handle_wallpaper_save(reset=path.endswith("/reset"))
+                return
+            if path == "/api/pick":
+                self.handle_pick()
+                return
+            if path == "/api/project/detect":
+                self.handle_project_detect()
+                return
+            if path == "/api/console/restart":
+                self.discard_body()
+                self.handle_console_restart()
+                return
+            if path == "/api/console/stop":
+                self.discard_body()
+                self.handle_console_stop()
+                return
+            if path == "/api/apps":
+                self.handle_app_create()
+                return
+            if path == "/api/apps/reorder":
+                self.handle_apps_reorder()
+                return
+            m = APP_ROUTE_RE.match(path)
+            if m:
+                app_id, action = m.group(1), m.group(2)
+                if action == "start":
+                    self.discard_body()
+                    self.handle_app_start(app_id)
+                    return
+                if action == "stop":
+                    self.discard_body()
+                    self.handle_app_stop(app_id)
+                    return
+                if action == "restart":
+                    self.discard_body()
+                    self.handle_app_restart(app_id)
+                    return
+                if action == "diagnose":
+                    self.discard_body()
+                    self.handle_app_diagnose(app_id)
+                    return
+                if action == "attach":
+                    self.handle_app_attach(app_id)
+                    return
+                if action == "icon":
+                    self.handle_icon_upload(app_id)
+                    return
+                if action == "exe-icon":
+                    self.discard_body()
+                    self.handle_exe_icon(app_id)
+                    return
+                if action == "favicon":
+                    self.discard_body()
+                    self.handle_fetch_favicon(app_id)
+                    return
+            self.send_err(404, "接口不存在")
+        except (BrokenPipeError, ConnectionResetError,
+                ConnectionAbortedError):
+            pass
+        except Exception as e:
+            self._handle_request_error("POST", e)
+
+    def handle_pick(self):
+        data, err = self.read_json_body()
+        if err:
+            self.send_err(400, err)
+            return
+        what = data.get("what")
+        if what not in ("dir", "script"):
+            self.send_err(400, "what 必须是 dir/script")
+            return
+        shell = data.get("shell")
+        if shell is not None and shell not in (("cmd", "powershell") if IS_WIN else ("bash",)):
+            self.send_err(400, "不支持的执行方式")
+            return
+        path, canceled = pick_path(what)
+        if canceled:  # 用户取消不是错误，前端静默
+            self.send_json({"ok": True, "canceled": True})
+        elif not path:
+            self.send_json({"ok": False, "error": "无法打开系统选择框"})
+        else:
+            result = {"ok": True, "path": path}
+            if what == "script":
+                result["command"] = command_for_script(path, shell)
+                result["cwd"] = os.path.dirname(path)
+                result["name"] = os.path.splitext(os.path.basename(path))[0]
+            self.send_json(result)
+
+    def handle_project_detect(self):
+        data, err = self.read_json_body()
+        if err:
+            self.send_err(400, err)
+            return
+        result, err = detect_project(data.get("cwd"))
+        if err:
+            self.send_err(400, err)
+            return
+        self.send_json(result)
+
+    def handle_app_diagnose(self, app_id):
+        cfg = self.server.cfg.snapshot()
+        app = find_app(cfg, app_id)
+        if not app:
+            self.send_err(404, "应用不存在")
+            return
+        self.send_json(diagnose_app(cfg, app))
+
+    def handle_ui_theme(self):
+        data, err = self.read_json_body()
+        if err:
+            self.send_err(400, err)
+            return
+        theme_id = str(data.get("theme") or "")
+        known = {t["id"] for t in list_themes()}
+        if theme_id not in known:
+            self.send_err(400, "未知主题: %s" % theme_id)
+            return
+        self.server.cfg.update(lambda d: d.__setitem__("uiTheme", theme_id))
+        self.send_json({"ok": True, "theme": theme_id})
+
+    def wallpaper_path(self):
+        theme = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("theme", ["apple"])[0]
+        if theme not in ("apple", "rain"):
+            if self.command == "POST":
+                self.discard_body()
+            self.send_err(400, "该主题不支持更换壁纸")
+            return None
+        return os.path.join(os.path.dirname(self.server.cfg._path), theme + "-wallpaper")
+
+    def handle_wallpaper_get(self):
+        path = self.wallpaper_path()
+        if path is None:
+            return
+        default = "/assets/rain-courtyard.webp" if path.endswith("rain-wallpaper") else "/assets/apple-architecture.png"
+        try:
+            with open(path, "rb") as f:
+                raw = f.read(MAX_ICON_BYTES + 1)
+        except FileNotFoundError:
+            self.serve_static(default)
+            return
+        kind = sniff_image(raw)
+        if kind is None or len(raw) > MAX_ICON_BYTES:
+            self.serve_static(default)
+            return
+        self._send(raw, 200, STATIC_TYPES["." + kind], set_cookie=False)
+
+    def handle_wallpaper_save(self, reset=False):
+        path = self.wallpaper_path()
+        if path is None:
+            return
+        if reset:
+            _, err = self.read_json_body()
+            if err:
+                self.send_err(400, err)
+                return
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+        else:
+            length = int(self.headers["Content-Length"])
+            raw = self.rfile.read(length)
+            if len(raw) != length or sniff_image(raw) is None:
+                self.send_err(400, "仅支持 PNG / JPEG / WebP 图片")
+                return
+            # A unique temporary file keeps concurrent uploads and failed writes atomic.
+            temp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(dir=os.path.dirname(path) or ".", delete=False) as f:
+                    temp_path = f.name
+                    f.write(raw)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(temp_path, path)
+            finally:
+                if temp_path and os.path.exists(temp_path):
+                    os.remove(temp_path)
+        self.send_json({"ok": True})
+
+    def handle_console_restart(self):
+        reserved, current, helper_pid = self.server.reserve_console_action("restart")
+        if not reserved:
+            if current == "restart":
+                self.send_json({"ok": True, "pid": SELF_PID,
+                                "helperPid": helper_pid,
+                                "port": self.server.console_port,
+                                "alreadyScheduled": True})
+            else:
+                self.send_err(409, "总控台正在停止，无法重复重启")
+            return
+        try:
+            helper_pid = schedule_console_restart(
+                self.server, self.server.console_port)
+        except OSError as e:
+            self.server.release_console_action("restart")
+            self.send_err(500, "无法启动重启程序: %s" % e)
+            return
+        self.server.set_console_helper_pid(helper_pid)
+        invalidate_state_cache()
+        self.send_json({"ok": True, "pid": SELF_PID,
+                        "helperPid": helper_pid,
+                        "port": self.server.console_port})
+
+    def handle_console_stop(self):
+        reserved, current, _ = self.server.reserve_console_action("stop")
+        if not reserved:
+            if current == "stop":
+                self.send_json({"ok": True, "pid": SELF_PID,
+                                "port": self.server.console_port,
+                                "alreadyScheduled": True})
+            else:
+                self.send_err(409, "总控台正在重启，无法同时停止")
+            return
+        schedule_console_stop(self.server)
+        invalidate_state_cache()
+        self.send_json({"ok": True, "pid": SELF_PID,
+                        "port": self.server.console_port})
+
+    def handle_kill(self):
+        data, err = self.read_json_body()
+        if err:
+            self.send_err(400, err)
+            return
+        pid = data.get("pid")
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            self.send_err(400, "缺少字段 pid（正整数）")
+            return
+        if pid == SELF_PID:
+            self.send_json({'ok': False, 'error': '不能结束总控台自身进程'})
+            return
+        try:
+            with confirmed_process(pid, data.get('created')):
+                self._handle_confirmed_kill(data, pid)
+        except ValueError as exc:
+            self.send_err(409, str(exc))
+
+    def _handle_confirmed_kill(self, data, pid):
+        cfg = self.server.cfg
+        owners = [a for a in cfg.snapshot()['apps'] if pid in managed_pids(a)]
+        app_id = data.get('appId')
+        if len(owners) > 1 or (owners[0]['id'] if owners else None) != app_id:
+            self.send_err(409, '进程与卡片关联已变化，请刷新后重试')
+            return
+        if owners:
+            app_id = owners[0]['id']
+            lock = self.server.try_app_operation(app_id)
+            if lock is None:
+                self.send_err(409, '应用已有其他操作正在执行')
+                return
+            try:
+                app = find_app(cfg.snapshot(), app_id)
+                if app is None or pid not in managed_pids(app):
+                    self.send_err(409, '进程与卡片关联已变化，请刷新后重试')
+                    return
+                body, status = operate_app(cfg, app, 'stop', force=bool(data.get('force')))
+                invalidate_state_cache()
+                self.send_json(body, status)
+            finally:
+                lock.release()
+            return
+        ok, err = kill_process(pid, bool(data.get("force")))
+        if ok:
+            invalidate_state_cache()
+        self.send_json({"ok": True} if ok else {"ok": False, "error": err})
+
+    def handle_flag(self):
+        data, err = self.read_json_body()
+        if err:
+            self.send_err(400, err)
+            return
+        key, flag, value = data.get("key"), data.get("flag"), data.get("value")
+        if not isinstance(key, str) or not key:
+            self.send_err(400, "缺少字段 key")
+            return
+        if flag not in ("hidden", "pinned", "promoted"):
+            self.send_err(400, "flag 必须是 hidden/pinned/promoted")
+            return
+        if not isinstance(value, bool):
+            self.send_err(400, "value 必须是布尔值")
+            return
+
+        def op(c):
+            lst = c.setdefault(flag, [])
+            if value and key not in lst:
+                lst.append(key)
+            elif not value and key in lst:
+                lst.remove(key)
+
+        self.server.cfg.update(op)
+        self.send_json({"ok": True})
+
+    def handle_watch(self):
+        data, err = self.read_json_body()
+        if err:
+            self.send_err(400, err)
+            return
+        keyword, action = data.get("keyword"), data.get("action")
+        if not isinstance(keyword, str) or not keyword.strip():
+            self.send_err(400, "缺少字段 keyword")
+            return
+        if action not in ("add", "remove"):
+            self.send_err(400, "action 必须是 add/remove")
+            return
+        keyword = keyword.strip()
+
+        def op(c):
+            kws = c.setdefault("watchedKeywords", [])
+            if action == "add" and keyword not in kws:
+                kws.append(keyword)
+            elif action == "remove":
+                c["watchedKeywords"] = [k for k in kws if k != keyword]
+            return list(c["watchedKeywords"])
+
+        keywords = self.server.cfg.update(op)
+        self.send_json({"ok": True, "keywords": keywords})
+
+    def handle_app_create(self):
+        data, err = self.read_json_body()
+        if err:
+            self.send_err(400, err)
+            return
+        attach_pid = data.get("attachPid")
+        if attach_pid is not None and (
+                not isinstance(attach_pid, int)
+                or isinstance(attach_pid, bool)
+                or attach_pid <= 0):
+            self.send_err(400, "attachPid 必须是正整数")
+            return
+        fields, err = validate_app_fields(data, partial=False)
+        if err:
+            self.send_err(400, err)
+            return
+
+        snapshot = self.server.cfg.snapshot()
+        new_id = secrets.token_hex(4)
+        while find_app(snapshot, new_id):
+            new_id = secrets.token_hex(4)
+        app = {"id": new_id, "name": fields["name"],
+               "shell": fields["shell"],
+               "command": fields["command"], "cwd": fields["cwd"],
+               "port": fields["port"], "emoji": fields["emoji"],
+               "glyph": fields["glyph"], "kind": fields["kind"],
+               "icon": None, "favicon": None, "lastPid": None,
+               "lastPgid": None, "runToken": None,
+               "attached": False, "lastExit": None,
+               "createdAt": int(time.time())}
+        app.update(copy.deepcopy(APP_FIELDS))
+        app.update(fields)
+        cwd_updated = False
+        if attach_pid is not None:
+            ok, error, identity = inspect_attach_process(
+                self.server.cfg, app, attach_pid)
+            if not ok:
+                self.send_json(
+                    {"ok": False, "error": error},
+                    identity.get("status", 409),
+                )
+                return
+            actual_cwd = identity["cwd"]
+            try:
+                cwd_updated = (
+                    not app.get("cwd")
+                    or os.path.realpath(app["cwd"]) != os.path.realpath(actual_cwd)
+                )
+            except OSError:
+                cwd_updated = True
+            app["cwd"] = actual_cwd
+            app["lastPid"] = attach_pid
+            app["attached"] = True
+            app['expectedRunning'] = True
+            app['startedAt'] = time.time()
+
+        attach_conflict = [False]
+
+        def op(c):
+            if find_app(c, new_id):
+                return None
+            # 与 attach_app_process 同规则：写锁内重验 pid 未被其他卡片认领。
+            if attach_pid is not None and any(
+                    other.get("lastPid") == attach_pid
+                    for other in c.get("apps") or []):
+                attach_conflict[0] = True
+                return None
+            c["apps"].append(app)
+            return dict(app)
+
+        created = self.server.cfg.update(op)
+        if created is None:
+            if attach_conflict[0]:
+                self.send_json(
+                    {"ok": False, "error": "该进程已由其他卡片管理"}, 409)
+            else:
+                self.send_err(409, "应用标识发生冲突，请重试")
+            return
+        if attach_pid is not None:
+            created.update({
+                "attached": True,
+                "running": True,
+                "pid": attach_pid,
+                "cwdUpdated": cwd_updated,
+            })
+        self.send_json(created)
+
+    @serialized_app_operation
+    def handle_fetch_favicon(self, app_id):
+        """抓取应用有效端口对应站点的 favicon，存为 data/icons/fav-{id}.{ext}。
+        优先级低于用户自定义 icon/glyph，仅作兜底。"""
+        _, app = self._get_app_or_404(app_id)
+        if app is None:
+            return
+        live = set(managed_pids(app))
+        port = None
+        listeners = scan_listeners()
+        configured_port = app.get("port")
+        if configured_port and any(pid in live and p == configured_port
+                                   for pid, p in listeners):
+            port = configured_port
+        if not port:
+            owned_ports = sorted({p for pid, p in listeners if pid in live})
+            port = owned_ports[0] if owned_ports else None
+        if not port:
+            self.send_json({"ok": False, "error": "应用未运行或无可用端口"})
+            return
+        host = listener_open_host(listeners, port, live)
+        data, ext = fetch_favicon(port, host)
+        if not data:
+            self.send_json({"ok": False, "error": "未找到站点图标"})
+            return
+        fname = "fav-%s.%s" % (app_id, ext)
+        try:
+            _ensure_private_dir(ICONS_DIR)
+            write_private_bytes(os.path.join(ICONS_DIR, fname), data)
+        except OSError as e:
+            self.send_json({"ok": False, "error": "图标保存失败: %s" % e})
+            return
+        url = "/icons/" + fname
+
+        def op(c):
+            target = find_app(c, app_id)
+            if target:
+                target["favicon"] = url
+
+        self.server.cfg.update(op)
+        self.send_json({"ok": True, "favicon": url})
+
+    def handle_apps_reorder(self):
+        """按收到的 id 顺序重排 apps（Python sort 稳定：未涉及的 id 相对顺序不变，
+        服务/任务两区可独立排序互不干扰）。"""
+        data, err = self.read_json_body()
+        if err:
+            self.send_err(400, err)
+            return
+        ids = data.get("ids")
+        if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+            self.send_err(400, "ids 必须是字符串数组")
+            return
+        order = {i: n for n, i in enumerate(ids)}
+
+        def op(c):
+            c["apps"].sort(key=lambda a: order.get(a.get("id"), len(order)))
+
+        self.server.cfg.update(op)
+        self.send_json({"ok": True})
+
+    @serialized_app_operation
+    def handle_app_start(self, app_id):
+        _, app = self._get_app_or_404(app_id)
+        if app is None:
+            return
+        body, status = operate_app(self.server.cfg, app, 'start')
+        self.send_json(body, status)
+
+    @serialized_app_operation
+    def handle_app_stop(self, app_id):
+        _, app = self._get_app_or_404(app_id)
+        if app is None:
+            return
+        body, status = operate_app(self.server.cfg, app, 'stop')
+        self.send_json(body, status)
+
+    @serialized_app_operation
+    def handle_app_attach(self, app_id):
+        _, app = self._get_app_or_404(app_id)
+        if app is None:
+            return
+        data, err = self.read_json_body()
+        if err:
+            self.send_err(400, err)
+            return
+        pid = data.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            self.send_err(400, "pid 必须是正整数")
+            return
+        ok, error, info = attach_app_process(self.server.cfg, app_id, app, pid)
+        if not ok:
+            self.send_json({"ok": False, "error": error}, info.get("status", 409))
+            return
+        resp = {"ok": True, "pid": pid}
+        resp.update(info)
+        self.send_json(resp)
+
+    @serialized_app_operation
+    def handle_app_restart(self, app_id):
+        _, app = self._get_app_or_404(app_id)
+        if app is None:
+            return
+        body, status = operate_app(self.server.cfg, app, 'restart')
+        self.send_json(body, status)
+
+    @serialized_app_operation
+    def handle_exe_icon(self, app_id):
+        _, app = self._get_app_or_404(app_id)
+        if app is None:
+            return
+        if app.get('icon'):
+            self.send_json({'ok': True, 'icon': app['icon']})
+            return
+        raw = extract_app_exe_icon(app)
+        if raw is None:
+            self.send_json({'ok': True, 'icon': None})
+            return
+        _ensure_private_dir(ICONS_DIR)
+        filename = app_id + '.png'
+        write_private_bytes(os.path.join(ICONS_DIR, filename), raw)
+        url = '/icons/' + filename
+        self.server.cfg.update(lambda c: find_app(c, app_id).update(icon=url))
+        self.send_json({'ok': True, 'icon': url})
+
+    @serialized_app_operation
+    def handle_icon_upload(self, app_id):
+        _, app = self._get_app_or_404(app_id)
+        if app is None:
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or -1)
+        except ValueError:
+            length = -1
+        if length < 0:
+            self.send_err(400, "缺少 Content-Length")
+            return
+        if length > MAX_ICON_BYTES:
+            self.send_err(400, "图标大小不能超过 5MB")
+            return
+        raw = self.rfile.read(length)
+        kind = sniff_image(raw)
+        if kind is None:
+            self.send_err(400, "仅支持 PNG / JPEG / WebP 图片")
+            return
+        _ensure_private_dir(ICONS_DIR)
+        for ext in ICON_EXTS:
+            old = os.path.join(ICONS_DIR, app_id + ext)
+            if ext != "." + kind and os.path.isfile(old):
+                try:
+                    os.remove(old)
+                except OSError:
+                    pass
+        fname = "%s.%s" % (app_id, kind)
+        try:
+            write_private_bytes(os.path.join(ICONS_DIR, fname), raw)
+        except OSError as e:
+            self.send_err(500, "图标保存失败: %s" % e)
+            return
+        icon_url = "/icons/" + fname
+
+        def op(c):
+            target = find_app(c, app_id)
+            if target:
+                target["icon"] = icon_url
+
+        self.server.cfg.update(op)
+        self.send_json({"ok": True, "icon": icon_url})
+
+    # ---------- PUT ----------
+
+    def do_PUT(self):
+        operation_lock = None
+        try:
+            if not self.authorize_request(mutating=True,
+                                          content_kind="json"):
+                return
+            path = urllib.parse.urlparse(self.path).path
+            m = APP_ROUTE_RE.match(path)
+            if not (m and m.group(2) is None):
+                self.send_err(404, "接口不存在")
+                return
+            operation_lock = self.server.try_app_operation(m.group(1))
+            if operation_lock is None:
+                self.send_err(409, "该应用正在执行其他操作，请稍后重试")
+                return
+            data, err = self.read_json_body()
+            if err:
+                self.send_err(400, err)
+                return
+            stop_before_update = data.get("stopBeforeUpdate", False)
+            if not isinstance(stop_before_update, bool):
+                self.send_err(400, "stopBeforeUpdate 必须是布尔值")
+                return
+            _, app = self._get_app_or_404(m.group(1))
+            if app is None:
+                return
+            fields, err = validate_app_fields(data, partial=True)
+            if err:
+                self.send_err(400, err)
+                return
+            if not fields:
+                self.send_err(400, "没有可更新的字段")
+                return
+            merged = {**app, **fields}
+            try:
+                validate_stop_action(merged)
+                preview = self.server.cfg.snapshot()
+                find_app(preview, app['id']).update(fields)
+                reconcile_app_presets(preview, app['id'])
+            except ValueError as exc:
+                self.send_err(400, str(exc))
+                return
+            lifecycle_fields = {"command", "cwd", "port", "kind", "shell"}
+            lifecycle_changed = any(
+                key in fields and fields[key] != (app_shell(app) if key == "shell" else app.get(key))
+                for key in lifecycle_fields)
+            stopped_for_update = False
+            if lifecycle_changed and app_alive_sign(app):
+                if not stop_before_update:
+                    stop_label = ("中止任务"
+                                  if (app.get("kind") or "service") == "task"
+                                  else "停止服务")
+                    self.send_json({
+                        "ok": False,
+                        "error": "应用正在运行，请先在当前编辑面板%s；填写内容会保留" %
+                                 stop_label,
+                        "requiresStop": True,
+                    }, 409)
+                    return
+                ok, stop_error, stopped_for_update = stop_app_for_update(
+                    self.server.cfg, app)
+                if not ok:
+                    self.send_err(409, stop_error)
+                    return
+
+            def op(c):
+                target = find_app(c, m.group(1))
+                target.update(fields)
+                reconcile_app_presets(c, target['id'])
+                if lifecycle_changed:
+                    target['instanceMatch'] = None
+                    if target.get('windowBinding'):
+                        target['windowBinding'].pop('match', None)
+                return dict(target)
+
+            updated = self.server.cfg.update(op)
+            if stopped_for_update:
+                updated = dict(updated)
+                updated["stoppedForUpdate"] = True
+            self.send_json(updated)
+        except (BrokenPipeError, ConnectionResetError,
+                ConnectionAbortedError):
+            pass
+        except Exception as e:
+            self._handle_request_error("PUT", e)
+        finally:
+            if operation_lock is not None:
+                operation_lock.release()
+
+    # ---------- DELETE ----------
+
+    def do_DELETE(self):
+        try:
+            if not self.authorize_request(mutating=True):
+                return
+            path = urllib.parse.urlparse(self.path).path
+            m = APP_ROUTE_RE.match(path)
+            if not m:
+                self.send_err(404, "接口不存在")
+                return
+            app_id, action = m.group(1), m.group(2)
+            if action is None:
+                self.handle_app_delete(app_id)
+                return
+            if action == "icon":
+                self.handle_icon_delete(app_id)
+                return
+            self.send_err(404, "接口不存在")
+        except (BrokenPipeError, ConnectionResetError,
+                ConnectionAbortedError):
+            pass
+        except Exception as e:
+            self._handle_request_error("DELETE", e)
+
+    def do_OPTIONS(self):
+        # No CORS endpoint exists. An explicit denial is clearer than the
+        # BaseHTTPRequestHandler HTML 501 response and never grants ACAO.
+        self._deny_request(403, "控制台不接受跨域预检请求")
+
+    @serialized_app_operation
+    def handle_app_delete(self, app_id):
+        _, app = self._get_app_or_404(app_id)
+        if app is None:
+            return
+        preview = self.server.cfg.snapshot()
+        preview['apps'] = [a for a in preview['apps'] if a['id'] != app_id]
+        try:
+            reconcile_app_presets(preview, app_id)
+        except ValueError as exc:
+            self.send_err(409, str(exc))
+            return
+        if app_running(app):
+            stopped, error = stop_app_and_clear(self.server.cfg, app)
+            if not stopped:
+                self.send_err(409, "删除已取消：%s" %
+                              (error or "应用未能正常退出"))
+                return
+
+        def op(c):
+            before = len(c["apps"])
+            c["apps"] = [a for a in c["apps"] if a.get("id") != app_id]
+            reconcile_app_presets(c, app_id)
+            return len(c["apps"]) != before
+
+        if not self.server.cfg.update(op):
+            self.send_err(404, "应用不存在")
+            return
+        self.server.forget_app_lock(app_id)
+
+        for ext in ICON_EXTS:
+            for fname in (app_id + ext, "fav-" + app_id + ext):
+                try:
+                    os.remove(os.path.join(ICONS_DIR, fname))
+                except OSError:
+                    pass
+        log_path = os.path.join(LOGS_DIR, "%s.log" % app_id)
+        for candidate in [log_path] + ["%s.%d" % (log_path, i)
+                                       for i in range(1, LOG_BACKUPS + 1)]:
+            try:
+                os.remove(candidate)
+            except OSError:
+                pass
+
+        self.send_json({"ok": True})
+
+    @serialized_app_operation
+    def handle_icon_delete(self, app_id):
+        _, app = self._get_app_or_404(app_id)
+        if app is None:
+            return
+        for ext in ICON_EXTS:
+            try:
+                os.remove(os.path.join(ICONS_DIR, app_id + ext))
+            except OSError:
+                pass
+
+        def op(c):
+            target = find_app(c, app_id)
+            if target:
+                target["icon"] = None
+
+        self.server.cfg.update(op)
+        self.send_json({"ok": True})
+
+
+# ---------------------------------------------------------------- 启动
+
+def find_chrome_executable():
+    if not IS_WIN:
+        return None
+    import winreg
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            with winreg.OpenKey(hive, r'Software\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe') as key:
+                path = winreg.QueryValueEx(key, '')[0]
+                if isinstance(path, str) and os.path.isfile(path):
+                    return path
+        except OSError:
+            pass
+    for variable in ('PROGRAMFILES', 'PROGRAMFILES(X86)', 'LOCALAPPDATA'):
+        base = os.environ.get(variable)
+        if base:
+            path = os.path.join(base, 'Google', 'Chrome', 'Application', 'chrome.exe')
+            if os.path.isfile(path):
+                return path
+    return None
+
+
+def open_console_url(port):
+    """在桌面启动场景中打开控制台，并为 Windows 提供可观测兜底。"""
+    url = "http://%s:%d/" % (HOST, int(port))
+    errors = []
+    if IS_WIN:
+        chrome = find_chrome_executable()
+        if chrome:
+            try:
+                subprocess.Popen([chrome, '--app=' + url],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, creationflags=independent_windows_flags())
+                return True
+            except OSError as exc:
+                errors.append('Chrome app window: %s' % exc)
+        startfile = getattr(os, "startfile", None)
+        if startfile is not None:
+            try:
+                # os.startfile 返回 None 也表示 ShellExecute 已提交，不能
+                # 把返回值当作成功标志。
+                startfile(url)
+                return True
+            except (OSError, AttributeError) as exc:
+                errors.append("ShellExecute: %s" % exc)
+    try:
+        if webbrowser.open(url, new=2, autoraise=True):
+            return True
+    except Exception as exc:  # 浏览器注册表或默认浏览器损坏时兜底
+        errors.append("webbrowser: %s" % exc)
+    if IS_WIN:
+        try:
+            subprocess.Popen(
+                ["cmd.exe", "/d", "/c", "start", "", url],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            return True
+        except (OSError, ValueError) as exc:
+            errors.append("cmd start: %s" % exc)
+    LOG.warning("无法自动打开控制台浏览器（%s），请手动访问 %s",
+                "; ".join(errors) or "默认浏览器未接受请求", url)
+    return False
+
+
+def open_browser_later(port, delay=0.8):
+    def _open():
+        try:
+            time.sleep(delay)
+            open_console_url(port)
+        except Exception:
+            pass
+    threading.Thread(target=_open, daemon=True).start()
+
+
+def find_console_instances():
+    """查找从同一项目目录启动的总控台，用于双击启动器去重。"""
+    snap = ps_snapshot(None, with_uid=True)
+    candidates = []
+    for pid, info in snap.items():
+        args = info.get("args") or ""
+        if (pid == SELF_PID or info.get("uid") != SELF_UID
+                or "server.py" not in args
+                or "--restart-helper" in args):
+            continue
+        candidates.append(pid)
+    cwds = lsof_cwds(candidates)
+    listener_map = {}
+    for pid, port in scan_listeners():
+        listener_map.setdefault(pid, []).append(port)
+    result = []
+    for pid in candidates:
+        cwd = cwds.get(pid)
+        try:
+            same_dir = cwd and os.path.realpath(cwd) == os.path.realpath(BASE_DIR)
+        except OSError:
+            same_dir = False
+        if not same_dir:
+            continue
+        info = snap.get(pid, {})
+        result.append({
+            "pid": pid,
+            "ports": sorted(listener_map.get(pid, [])),
+            "cmd": info.get("args") or "",
+            "cwd": cwd,
+            "uptimeSec": info.get("etime"),
+        })
+    return sorted(result, key=lambda item: (item["ports"] or [65536], item["pid"]))
+
+
+def _launcher_dialog(message):
+    """Windows 无 osascript：不弹窗，直接返回 None（等价于取消）。"""
+    if IS_WIN:
+        LOG.info("启动器对话框（Windows 跳过）：%s", message)
+        return None
+    script = """on run argv
+set messageText to item 1 of argv
+display dialog messageText with title "总控台" buttons {"取消", "重新启动", "打开控制台"} default button "打开控制台" cancel button "取消" with icon note
+return button returned of result
+end run"""
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script, message], capture_output=True,
+            text=True, timeout=180)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _launcher_alert(message):
+    """Windows 无 osascript：只进日志。"""
+    if IS_WIN:
+        LOG.error("启动器告警（Windows）：%s", message)
+        return
+    script = """on run argv
+display alert "总控台" message (item 1 of argv) as critical
+end run"""
+    try:
+        subprocess.run(["osascript", "-e", script, message],
+                       capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def launcher_main():
+    """start.command / start.bat 的无命令启动入口。"""
+    instances = find_console_instances()
+    if IS_WIN:
+        # Windows 没有 osascript 重启对话框：已有实例就打开页面，否则启动。
+        if instances:
+            ports = [p for item in instances for p in item["ports"]]
+            port = min(ports) if ports else PORT_START
+            open_console_url(port)
+            return
+        try:
+            main(log_to_file=True)
+        except Exception:
+            _launcher_alert("总控台启动失败。请检查数据目录权限和 console.log。")
+            raise
+        return
+    if not instances:
+        try:
+            main(log_to_file=True)
+        except Exception:
+            _launcher_alert("总控台启动失败。请检查数据目录权限和 console.log。")
+            raise
+        return
+    labels = []
+    for item in instances:
+        ports = " / ".join(":%d" % p for p in item["ports"]) or "未监听"
+        labels.append("%s  ·  PID %d" % (ports, item["pid"]))
+    extra = ("\n\n检测到 %d 个同项目实例，重启时会合并为一个。" % len(instances)
+             if len(instances) > 1 else "")
+    choice = _launcher_dialog(
+        "总控台已在运行：\n" + "\n".join(labels) + extra)
+    if choice == "打开控制台":
+        ports = [p for item in instances for p in item["ports"]]
+        port = min(ports) if ports else PORT_START
+        open_console_url(port)
+        return
+    if choice != "重新启动":
+        return
+
+    preferred_ports = [p for item in instances for p in item["ports"]]
+    preferred = min(preferred_ports) if preferred_ports else PORT_START
+    targets = [item["pid"] for item in instances]
+    for pid in targets:
+        if process_uid(pid) == SELF_UID:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+    deadline = time.monotonic() + 8.0
+    while time.monotonic() < deadline and any(pid_alive(pid) for pid in targets):
+        time.sleep(0.1)
+    survivors = [pid for pid in targets if pid_alive(pid)]
+    if survivors:
+        _launcher_alert("旧总控台未能正常退出（PID %s），未强制结束。" %
+                        "、".join(str(pid) for pid in survivors))
+        return
+    try:
+        main(preferred_port=preferred, log_to_file=True)
+    except Exception:
+        _launcher_alert("总控台重启失败。请检查数据目录权限和 console.log。")
+        raise
+
+
+def schedule_console_restart(server, preferred_port):
+    """启动独立 helper，响应发出后关闭当前 HTTP 服务。"""
+    kwargs = {"cwd": BASE_DIR, "close_fds": True}
+    if IS_WIN:
+        kwargs["creationflags"] = independent_windows_flags()
+    else:
+        kwargs["start_new_session"] = True
+    helper = subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "--restart-helper",
+         str(SELF_PID), str(int(preferred_port))],
+        **kwargs)
+
+    def _shutdown():
+        time.sleep(0.25)
+        server.shutdown()
+    threading.Thread(target=_shutdown, daemon=True).start()
+    return helper.pid
+
+
+def schedule_console_stop(server):
+    """响应发送完成后关闭 HTTP 服务，不结束启动台里的独立进程组。"""
+    def _shutdown():
+        time.sleep(0.25)
+        server.shutdown()
+    threading.Thread(target=_shutdown, daemon=True).start()
+
+
+def restart_helper(old_pid, preferred_port):
+    """等旧进程释放端口后，在 helper 中启动新总控台。"""
+    deadline = time.monotonic() + 12.0
+    while time.monotonic() < deadline and pid_alive(old_pid):
+        time.sleep(0.1)
+    if pid_alive(old_pid):
+        return 1
+    if IS_WIN:
+        # CREATE_NO_WINDOW 没有可用的控制台句柄，复用启动器的文件日志。
+        main(preferred_port=preferred_port, open_browser=False, log_to_file=True)
+        return 0
+    args = [sys.executable, os.path.abspath(__file__),
+            "--preferred-port", str(int(preferred_port)), "--no-browser"]
+    os.execv(sys.executable, args)
+    return 0
+
+
+def _run_console(preferred_port=None, open_browser=True):
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    for private_dir in (DATA_DIR, ICONS_DIR, LOGS_DIR):
+        _ensure_private_dir(private_dir)
+    start_log_maintenance()
+    cfg = Config(CONFIG_PATH)
+
+    server, port = None, None
+    candidates = list(range(PORT_START, PORT_START + PORT_TRIES))
+    if isinstance(preferred_port, int) and preferred_port in candidates:
+        candidates.remove(preferred_port)
+        candidates.insert(0, preferred_port)
+    for p in candidates:
+        try:
+            server = ConsoleServer((HOST, p), Handler, cfg, p)
+            port = p
+            break
+        except OSError:
+            continue
+    if server is None:
+        print("错误：端口 %d-%d 均被占用，无法启动。" %
+              (PORT_START, PORT_START + PORT_TRIES - 1))
+        sys.exit(1)
+
+    from ops_monitor import Monitor
+    monitor = Monitor(server, sys.modules[__name__], notifications=os.environ.get('CONSOLE_NOTIFICATIONS') != '0')
+    monitor.start()
+
+    print("总控台已启动: http://%s:%d/  (Ctrl+C 停止)" % (HOST, port), flush=True)
+    if open_browser:
+        open_browser_later(port)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        monitor.close()
+        server.server_close()
+        print("已停止", flush=True)
+
+
+def redirect_console_output():
+    """在运行目录迁移完成后，将 .app 输出安全追加到 Library Logs。"""
+    path = os.path.join(LOGS_DIR, "console.log")
+    if IS_WIN:
+        # 从 .lnk/资源管理器启动时没有可继承的控制台句柄。对 fd 1/2
+        # 调用 dup2 会触发 Python 的 ``lost sys.stderr``，进而让启动器
+        # 在浏览器打开前退出。直接替换 TextIOWrapper 对两种启动方式
+        # 都安全，也保留启动日志和异常回溯。
+        global _LAUNCHER_LOG_STREAM
+        stream = open(path, "a", encoding="utf-8", buffering=1)
+        old_stream = _LAUNCHER_LOG_STREAM
+        _LAUNCHER_LOG_STREAM = stream
+        if old_stream is not None and old_stream is not stream:
+            try:
+                old_stream.close()
+            except OSError:
+                pass
+        sys.stdout = stream
+        sys.stderr = stream
+        return
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except (AttributeError, OSError):
+                pass
+        if IS_WIN:
+            # 重定向后 fd 仍是 CRT 文本模式，会与 TextIOWrapper 的
+            # 换行翻译叠加成 \r\r\n；切二进制模式只留一层翻译。
+            import msvcrt
+            msvcrt.setmode(fd, os.O_BINARY)
+            msvcrt.setmode(1, os.O_BINARY)
+            msvcrt.setmode(2, os.O_BINARY)
+        os.dup2(fd, 1)
+        os.dup2(fd, 2)
+    finally:
+        os.close(fd)
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except (AttributeError, OSError):
+            pass
+
+
+def main(preferred_port=None, open_browser=True, log_to_file=False):
+    """Run exactly one console for this project/data directory."""
+    migration = prepare_runtime_storage()
+    if log_to_file:
+        redirect_console_output()
+    if migration["dataMigrated"]:
+        print("已将项目内旧配置和图标复制到: %s" % DATA_DIR,
+              flush=True)
+    if migration["logsMigrated"]:
+        print("已将项目内旧日志复制到: %s" % LOGS_DIR,
+              flush=True)
+    instance_lock = acquire_instance_lock()
+    if instance_lock is None:
+        print("总控台已在运行（同一数据目录只允许一个实例）。", flush=True)
+        if open_browser:
+            instances = find_console_instances()
+            ports = [port for item in instances for port in item.get("ports", [])]
+            if ports:
+                open_console_url(min(ports))
+        return False
+    try:
+        _run_console(preferred_port, open_browser)
+        return True
+    finally:
+        release_instance_lock(instance_lock)
+
+
+if __name__ == "__main__":
+    if "--prepare-storage" in sys.argv:
+        # 供安装/诊断流程预先验证迁移和目录权限，不启动 HTTP。
+        prepare_runtime_storage()
+    elif "--launcher" in sys.argv:
+        launcher_main()
+    elif "--restart-helper" in sys.argv:
+        index = sys.argv.index("--restart-helper")
+        try:
+            old = int(sys.argv[index + 1])
+            preferred = int(sys.argv[index + 2])
+        except (ValueError, IndexError):
+            sys.exit(2)
+        sys.exit(restart_helper(old, preferred))
+    else:
+        preferred = None
+        if "--preferred-port" in sys.argv:
+            index = sys.argv.index("--preferred-port")
+            try:
+                preferred = int(sys.argv[index + 1])
+            except (ValueError, IndexError):
+                sys.exit(2)
+        main(preferred_port=preferred, open_browser="--no-browser" not in sys.argv)

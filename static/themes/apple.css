@@ -1,0 +1,88 @@
+/* Reuse the complete original skin for every existing component and state. */
+@import url('./ops.css');
+
+:root {
+  --room: #e9edf3; --card: rgb(255 255 255 / .56); --card-2: rgb(246 248 252 / .52);
+  --paper: var(--card); --bg: var(--room);
+  --ink: #080808; --ink-2: #111; --ink-3: #202020; --ink-4: #303030;
+  --line: rgb(255 255 255 / .65); --line-2: rgb(49 74 107 / .25);
+  --accent: #0071eb; --on-accent: #fff; --green: #13764e;
+  --shadow: 0 3px 12px #2538580b, inset 0 1px 0 #ffffff94;
+  --shadow-lg: 0 12px 28px #1d365b21, inset 0 1px 0 #ffffffaa;
+  --focus-ring: 0 0 0 3px #007aff66;
+  --apple-chrome: rgb(255 255 255 / .24);
+  --apple-panel: rgb(255 255 255 / .91);
+  --apple-wallpaper-opacity: 1;
+  --tag-drawer-duration: 260ms; --tag-drawer-ease: cubic-bezier(.32, .72, 0, 1);
+  --card-flip-out-easing: cubic-bezier(.4, 0, 1, 1);
+  --card-flip-in-easing: cubic-bezier(0, 0, .2, 1);
+}
+:root[data-theme="dark"] {
+  --room: #101722; --card: rgb(22 31 46 / .66); --card-2: rgb(25 37 55 / .65);
+  --ink: #f6f8ff; --ink-2: #d6e2f2; --ink-3: #c1cee1; --ink-4: #adbdd2;
+  --line: rgb(220 236 255 / .2); --line-2: rgb(220 236 255 / .32);
+  --accent: #69adff; --on-accent: #071a31; --green: #58dfa3;
+  --shadow: 0 3px 14px #0002, inset 0 1px 0 #ffffff14;
+  --shadow-lg: 0 12px 30px #0005, inset 0 1px 0 #ffffff21;
+  --apple-chrome: rgb(17 27 44 / .38); --apple-panel: rgb(22 31 46 / .96);
+  --apple-wallpaper-opacity: .42;
+}
+#appleWallpaper { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; pointer-events: none; opacity: var(--apple-wallpaper-opacity); transition: opacity 180ms ease-out; }
+html:not([data-ui-theme="apple"]) #appleWallpaper { display: none; }
+:root[data-ui-theme="apple"] body { background: var(--room); font-weight: 600; transition: background-color 180ms ease-out, color 180ms ease-out; }
+:root[data-ui-theme="apple"] :is(.shell, .shell-col, .main, .main-inner) { background: transparent; }
+:root[data-ui-theme="apple"] :is(.rail, .topbar, .ops-scenes) {
+  background: var(--apple-chrome); border-color: var(--line);
+  backdrop-filter: blur(9px) saturate(1.15); -webkit-backdrop-filter: blur(9px) saturate(1.15);
+  box-shadow: var(--shadow);
+}
+:root[data-ui-theme="apple"] .ops-scenes { border: 1px solid var(--line); border-radius: 16px; }
+:root[data-ui-theme="apple"] .rail { border-radius: 0 18px 18px 0; scrollbar-width: none; }
+:root[data-ui-theme="apple"] .rail::-webkit-scrollbar { display: none; }
+:root[data-ui-theme="apple"] .topbar { border-radius: 0 0 16px 16px; }
+:root[data-ui-theme="apple"] :is(.rail, .topbar, .ops-scenes)[data-liquid-glass="webgl"] {
+  background: transparent; backdrop-filter: none; -webkit-backdrop-filter: none;
+}
+:root[data-ui-theme="apple"] :is(.app-card, .folder-card, .center-section, .widget, .ov, .file-filters, .file-table-panel, .tbl) {
+  background: var(--card); border-color: var(--line); border-radius: 18px;
+  backdrop-filter: blur(12px) saturate(1.1); -webkit-backdrop-filter: blur(12px) saturate(1.1);
+  box-shadow: var(--shadow);
+}
+:root[data-ui-theme="apple"] :is(.app-card.has-alert, .app-card.has-error) { border-color: var(--red); }
+:root[data-ui-theme="apple"] .app-card:hover { box-shadow: var(--shadow-lg); }
+:root[data-ui-theme="apple"] :is(.modal, .drawer, .palette, .ops-panel, .ops-menu, .folder-menu-actions, .ops-alert-popover, .ops-resource-popover, .ops-preset-popover) {
+  background: var(--apple-panel); border-color: var(--line); border-radius: 18px;
+  backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); box-shadow: var(--shadow-lg);
+}
+:root[data-ui-theme="apple"] .ops-more > .ops-menu { background: transparent; box-shadow: none; backdrop-filter: none; }
+:root[data-ui-theme="apple"] :is(.app-name, .view-head h2, .center-section h3) { letter-spacing: -.025em; font-weight: 700; }
+:root[data-ui-theme="apple"] :is(.btn, .ops-tag, .ops-scene, .mini-tab, .ops-metric-value) { font-weight: 650; }
+:root[data-ui-theme="apple"] .rail-btn { color: var(--ink); font-weight: 650; }
+:root[data-ui-theme="apple"] :is(.rail-btn, .btn, .ibtn, .icon-btn, .mini-tab, .ops-tag, .ops-scene, .theme-choice) {
+  transition: transform 130ms var(--ease), background-color 140ms ease-out, color 140ms ease-out, box-shadow 140ms ease-out;
+}
+:root[data-ui-theme="apple"] :is(.btn, .ibtn, .icon-btn, .ops-tag, .ops-scene) { border-radius: 10px; }
+:root[data-ui-theme="apple"] :is(.ops-tag, .ops-scene, .mini-tab) { border-radius: 999px; }
+:root[data-ui-theme="apple"] :is(button, summary) { touch-action: manipulation; }
+:root[data-ui-theme="apple"] :is(.btn, .ibtn, .icon-btn, .mini-tab, .ops-tag, .rail-btn, .theme-choice):active:not(:disabled) {
+  transform: scale(.97); transition: transform 70ms ease-out;
+}
+:root[data-ui-theme="apple"] .ops-tag[aria-pressed="true"],
+:root[data-ui-theme="apple"] .mini-tab.active { background: var(--accent); color: var(--on-accent); border-color: transparent; }
+:root[data-ui-theme="apple"] .rail-nav { position: relative; isolation: isolate; }
+:root[data-ui-theme="apple"] .rail-btn { position: relative; z-index: 1; }
+:root[data-ui-theme="apple"] .rail-btn.active { background: transparent; border-color: transparent; }
+.apple-nav-selection { position: absolute; top: 0; left: 0; z-index: 0; pointer-events: none; border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent); border-radius: 12px; background: color-mix(in srgb, var(--accent) 14%, transparent); box-shadow: inset 0 1px 0 #ffffff70; }
+:root[data-ui-theme="apple"] .sec-label { color: var(--ink); text-shadow: 0 1px 4px var(--room); }
+:root[data-ui-theme="apple"] .sec-count { background: var(--card); }
+/* Ancestor opacity animations isolate backdrop sampling until the animation ends. */
+:root[data-ui-theme="apple"] :is(.view.active, .anim-in) { animation: none; }
+@media (prefers-reduced-motion: reduce) {
+  :root[data-ui-theme="apple"] :is(button, summary):active:not(:disabled) { transform: none; }
+}
+@media (prefers-reduced-transparency: reduce), (prefers-contrast: more) {
+  :root { --card: #fff; --card-2: #f2f5f9; --apple-chrome: #f1f5fa; --apple-panel: #fff; --line: #7a8ba0; }
+  :root[data-theme="dark"] { --card: #182230; --card-2: #202d3e; --apple-chrome: #182230; --apple-panel: #182230; --line: #71829b; }
+  #appleWallpaper { display: none; }
+  :root[data-ui-theme="apple"] :is(.rail, .topbar, .ops-scenes, .app-card, .folder-card, .center-section, .widget, .ov, .tbl, .file-table-panel, .file-filters) { backdrop-filter: none; -webkit-backdrop-filter: none; }
+}

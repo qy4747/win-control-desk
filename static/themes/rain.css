@@ -1,0 +1,178 @@
+@import url('./ops.css');
+
+:root {
+  --room: #0b2029; --card: rgb(16 43 54 / .48); --card-2: rgb(23 59 71 / .65);
+  --paper: var(--card); --bg: var(--room);
+  --ink: #f3fcff; --ink-2: #e0eff3; --ink-3: #c2d9df; --ink-4: #a9c6ce;
+  --line: #d3effd52; --line-2: #dcf5ff80;
+  --accent: #89e6dc; --accent-ink: #abfff0; --on-accent: #092d34;
+  --green: #6cf5b6; --red: #ffaaaa; --amber: #f8d292; --purple: #d4c6ff;
+  --shadow: 0 8px 24px #00172038, inset 0 1px 1px #effcff85, inset 0 -1px 1px #b4eaff42;
+  --shadow-lg: 0 18px 40px #00121f75, inset 0 1px 2px #f0ffffb0;
+  --focus-ring: 0 0 0 3px #94ffeea8;
+  --rain-wallpaper-opacity: 1; --rain-tint: .24; --rain-frost: .012; --rain-refraction: 78;
+  --rain-panel-refraction: 28; --rain-panel-capture: 8; --rain-panel-edge: 14;
+  --rain-panel: rgb(13 38 48 / .87);
+  --tag-drawer-duration: 260ms; --tag-drawer-closed: translateY(-12px) scaleY(.97);
+  --ease: cubic-bezier(.23, 1, .32, 1);
+  --card-flip-out-ms: 100; --card-flip-in-ms: 150;
+  --card-flip-out-easing: var(--ease);
+  --card-flip-in-easing: var(--ease);
+}
+:root[data-theme="dark"] {
+  --card: rgb(7 24 35 / .65); --card-2: rgb(15 39 52 / .8);
+  --rain-wallpaper-opacity: .7; --rain-tint: .4; --rain-panel: rgb(9 26 38 / .94);
+}
+:root[data-ui-theme="rain"] body { background: var(--room); }
+:root[data-ui-theme="rain"] body:not(:has(#rainWallpaper)) { background: var(--room) url('/assets/rain-courtyard.webp') center / cover fixed; }
+#rainWallpaper, #rainGlass, #rainDrops, #rainMist { position: fixed; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+#rainWallpaper { object-fit: cover; z-index: 0; opacity: var(--rain-wallpaper-opacity); }
+#rainMist { z-index: 1; backdrop-filter: blur(2.5px) saturate(.86); -webkit-backdrop-filter: blur(2.5px) saturate(.86); background: radial-gradient(ellipse at 12% 85%, #c5dce526, transparent 65%), radial-gradient(ellipse at 82% 15%, #dae8ef21, transparent 60%), #17334018; }
+:root[data-rain-mist="off"] #rainMist { display: none; }
+#rainDrops { z-index: 1; overflow: hidden; }
+#rainGlass { z-index: 2; }
+#rainDrops[hidden] { display: none; }
+#rainDrops i { position: absolute; left: var(--drop-x); top: -40px; width: 4px; height: 20px; border-radius: 70% 40% 65% 45%; border: 1px solid #d6f4ff50; background: linear-gradient(110deg, #fff7, #fff0 55%, #d7f5ff55); box-shadow: 1px 2px 3px #03141b70; animation: rain-slide var(--drop-duration) var(--drop-delay) linear infinite; }
+@keyframes rain-slide { 0% { transform: translate(0, -5vh) scaleY(.7); opacity: 0; } 8% { opacity: .65; } 48% { transform: translate(5px, 52vh) scaleY(1.3); } 85% { opacity: .5; } 100% { transform: translate(1px, 110vh) scaleY(.8); opacity: 0; } }
+:root[data-ui-theme="rain"] .shell { z-index: 3; }
+:root[data-ui-theme="rain"] :is(.shell-col, .main, .main-inner, .panel) { background: transparent; }
+:root[data-ui-theme="rain"] :is(.view.active, .anim-in) { animation: none; }
+:root[data-ui-theme="rain"] .rail { background: linear-gradient(90deg, #081f2b99, #0c253c42); border: 0; scrollbar-width: none; }
+:root[data-ui-theme="rain"] .topbar { background: transparent; border: 0; box-shadow: none; }
+:root[data-ui-theme="rain"] .topbar-inner { background: var(--card); border: 1px solid var(--line); border-radius: 0 0 34px 34px; box-shadow: var(--shadow); backdrop-filter: blur(3px); }
+:root[data-ui-theme="rain"] :is(.ops-scenes, .app-card, .folder-card, .center-section, .widget, .ov, .file-filters, .file-table-panel, .tbl) {
+  background: var(--card); border: 1px solid var(--line); border-radius: 28px;
+  backdrop-filter: blur(3px) saturate(1.12); -webkit-backdrop-filter: blur(3px) saturate(1.12);
+  box-shadow: var(--shadow); color: var(--ink);
+}
+:root[data-ui-theme="rain"] [data-rain-surface="webgl"] { background: rgb(9 34 43 / .13); backdrop-filter: none; -webkit-backdrop-filter: none; }
+:root[data-ui-theme="rain"] :is(.center-section, .tbl, .file-table-panel, .widget)[data-rain-surface="webgl"] { background: rgb(8 28 39 / .35); }
+:root[data-ui-theme="rain"] :is(.app-card, .folder-card)[data-rain-surface="webgl"] { background: linear-gradient(180deg, #09263340, #09263310 50%, #09263340); }
+:root[data-ui-theme="rain"] :is(.app-card, .folder-card) { --water-tilt: -.65deg; border-radius: 42px 23px 48px 26px / 29px 44px 31px 47px; text-shadow: 0 1px 3px #00121fc9; border-color: #d3effd38; }
+:root[data-ui-theme="rain"] :is(.app-card, .folder-card):nth-child(3n) { --water-tilt: .8deg; border-radius: 26px 48px 24px 42px / 45px 28px 46px 30px; }
+:root[data-ui-theme="rain"] :is(.app-card, .folder-card):nth-child(3n + 1) { --water-tilt: -.45deg; border-radius: 35px 24px 49px 22px / 24px 47px 28px 41px; }
+:root[data-ui-theme="rain"] :is(.app-card, .folder-card)::before { content: ''; position: absolute; inset: -3px -4px; transform: rotate(var(--water-tilt)); border: 1px solid #e5f9ff69; border-radius: inherit; pointer-events: none; background: radial-gradient(ellipse at 4% 0, #efffff2b, transparent 45%), radial-gradient(ellipse at 95% 100%, #8cdfe623, transparent 40%); box-shadow: inset 3px 2px 3px #ffffff36, inset -2px -3px 5px #cefaff50, 0 9px 17px #0014204d; }
+:root[data-ui-theme="rain"] :is(.app-card, .folder-card)::after { content: ''; position: absolute; width: 25px; height: 10px; top: -2px; right: 29px; transform: rotate(-18deg); border-radius: 60% 40% 58% 42%; background: linear-gradient(170deg, #f3ffffa3, #c4f5ff05 55%, #93d2e655); box-shadow: 1px 2px 3px #03172250, inset 1px 1px 2px #e9ffffb3; pointer-events: none; }
+:root[data-ui-theme="rain"] :is(.app-card, .folder-card):hover { box-shadow: 0 12px 32px #00172360, inset 0 1px 2px #e1ffffdc, 0 0 0 1px #a7eee74d; }
+:root[data-ui-theme="rain"] .app-icon { background: rgb(8 26 34 / .4); border-radius: 15px; box-shadow: 0 3px 9px #00192152; }
+:root[data-ui-theme="rain"] .app-icon img { border-radius: 13px; }
+:root[data-ui-theme="rain"] .ops-scenes { border-radius: 24px 30px 21px 26px; }
+:root[data-ui-theme="rain"] .center-section { border-radius: 30px; }
+:root[data-ui-theme="rain"] :is(.sec-label, .view-head, .brand-text, .rail-foot) { color: var(--ink); text-shadow: 0 2px 8px #00101c; }
+:root[data-ui-theme="rain"] :is(.btn, .ibtn, .icon-btn, .mini-tab, .ops-tag, .ops-scene, .rail-btn.active) {
+  border: 1px solid #d8f4ff5c; border-radius: 999px;
+  background: linear-gradient(165deg, #d5f4ff24, #0d34474a);
+  color: var(--ink); box-shadow: inset 0 1px 1px #efffff6b, 0 2px 5px #001f3040;
+  transition: color 160ms ease, border-color 160ms ease, background-color 160ms ease, box-shadow 160ms ease, transform 125ms var(--ease);
+}
+:root[data-ui-theme="rain"] :is(.btn-accent, .mini-tab.active, .rail-btn.active, .ops-tag[aria-pressed="true"], .ops-scene[aria-pressed="true"]) {
+  color: #f1ffff; border-color: #9afbedb3;
+  background: radial-gradient(ellipse at 50% 0, #acfaff70, transparent 70%), linear-gradient(150deg, #177d87d9, #064653c9);
+  box-shadow: inset 0 1px 3px #d7ffffe0, inset 0 -2px 5px #3fdcc06b, 0 0 14px #5edbd52b;
+}
+:root[data-ui-theme="rain"] :is(button, summary):focus-visible { outline: 2px solid #a6fff1; outline-offset: 3px; }
+:root[data-ui-theme="rain"] :is(.btn, .ibtn, .icon-btn, .mini-tab, .ops-tag, .ops-scene, .rail-btn):active:not(:disabled) { transform: scale(.97); transition-duration: 100ms; }
+:root[data-ui-theme="rain"] .btn:disabled { opacity: .55; }
+:root[data-ui-theme="rain"] .ops-more > summary { display: none; }
+:root[data-ui-theme="rain"] .app-head { padding-right: 0; }
+:root[data-ui-theme="rain"] .app-status { padding-right: 40px; }
+:root[data-ui-theme="rain"] :is(.modal, .drawer, .palette, .ops-panel, .ops-menu, .folder-menu-actions, .ops-alert-popover, .ops-resource-popover, .ops-preset-popover) { background: var(--rain-panel); border: 1px solid var(--line-2); border-radius: 24px; backdrop-filter: blur(12px); box-shadow: var(--shadow-lg); }
+:root[data-ui-theme="rain"] .ops-more > .ops-menu { background: transparent; border: 0; box-shadow: none; backdrop-filter: none; }
+:root[data-ui-theme="rain"] :is(input:not([type="checkbox"]):not([type="range"]), select, textarea) { background: #0c263c99; color: var(--ink); border-color: var(--line); border-radius: 12px; }
+:root[data-ui-theme="rain"] option { background: #143442; color: #f3fcff; }
+:root[data-ui-theme="rain"] :is(.tr.th, .file-table thead) { background: #12394cb0; color: var(--ink-2); }
+:root[data-ui-theme="rain"] .theme-choice { background: #08263652; border-color: var(--line); border-radius: 20px; }
+:root[data-ui-theme="rain"] .theme-choice[aria-pressed="true"] { border-color: var(--accent); box-shadow: 0 0 16px #75e3dd30; }
+/* Local state feedback; never animate the shared glass light or the card's content. */
+:root[data-ui-theme="rain"] :is(.rail-btn, .ops-tag, .ops-scene, .mini-tab) { position: relative; }
+:root[data-ui-theme="rain"] :is(.rail-btn, .ops-tag, .ops-scene, .mini-tab)::after {
+  content: ''; position: absolute; inset: -2px; border-radius: inherit; pointer-events: none;
+  border: 2px solid #a8fff0; box-shadow: 0 0 13px #69f2d866, inset 0 0 9px #98fff02e;
+  opacity: 0; transform: scale(.96); transition: opacity 160ms var(--ease), transform 160ms var(--ease);
+}
+:root[data-ui-theme="rain"] :is(.rail-btn.active, .ops-tag[aria-pressed="true"], .ops-scene[aria-pressed="true"], .mini-tab.active) {
+  background: radial-gradient(ellipse at 50% 0, #b7fff080, transparent 75%), linear-gradient(150deg, #158b8ff2, #08545ef2);
+  color: #fff; border-color: #baffef;
+}
+:root[data-ui-theme="rain"] :is(.rail-btn.active, .ops-tag[aria-pressed="true"], .ops-scene[aria-pressed="true"], .mini-tab.active)::after { opacity: 1; transform: scale(1); }
+/* State cues must win over the shared glass material and selection paint. */
+:root[data-ui-theme="rain"] .btn.btn-stop { color: var(--red); border-color: var(--red); }
+:root[data-ui-theme="rain"] .btn.btn-stop:hover:not(:disabled) { background: color-mix(in srgb, var(--red) 16%, var(--card)); }
+:root[data-ui-theme="rain"] :is(.app-card.has-error, .app-card.has-alert) { border-color: var(--red); outline: 1px solid var(--red); outline-offset: 1px; }
+:root[data-ui-theme="rain"] .ops-scene.is-current { border-bottom: 3px solid var(--accent); }
+:root[data-ui-theme="rain"] .ops-scene.is-pending { border-style: dashed; }
+:root[data-ui-theme="rain"] :is(.app-card, .folder-card)::before {
+  opacity: .5; background: radial-gradient(ellipse at 8% 0, #b8fff05c, transparent 62%), radial-gradient(ellipse at 95% 100%, #71d6ee38, transparent 50%);
+  box-shadow: inset 3px 2px 3px #ffffff69, inset -2px -3px 6px #91fff273, 0 12px 22px #00142085, 0 0 0 1px #9affe99c, 0 0 18px #66dfd52e;
+  transition: opacity 160ms var(--ease), transform 160ms var(--ease);
+}
+:root[data-ui-theme="rain"] :is(.app-card, .folder-card)::after { transition: transform 160ms var(--ease), opacity 160ms var(--ease); }
+@media (hover: hover) and (pointer: fine) {
+  :root[data-ui-theme="rain"] :is(.app-card, .folder-card):hover::before { opacity: 1; transform: rotate(var(--water-tilt)) scale(1.012); }
+  :root[data-ui-theme="rain"] :is(.app-card, .folder-card):hover::after { transform: translateY(-2px) rotate(-8deg); }
+}
+:root[data-ui-theme="rain"] :is(.app-card, .folder-card):focus-within::before { opacity: 1; transition: none; }
+:root[data-ui-theme="rain"] :is(.rail-btn, .ops-tag, .ops-scene, .mini-tab):focus-visible::after { transition: none; }
+/* Keep the shared glass stationary; only the page's foreground content fades in. */
+:root[data-ui-theme="rain"] .view.active :is(.app-head, .app-actions, .center-section > h3, .view-head, .folder-name) {
+  animation: rain-content-in 160ms var(--ease);
+}
+@keyframes rain-content-in { from { opacity: .35; } to { opacity: 1; } }
+:root[data-ui-theme="rain"] :is(.rail-btn, .ops-package, .ops-metric, .theme-choice) {
+  transition: color 160ms ease, background-color 160ms ease, border-color 160ms ease, box-shadow 160ms ease, transform 125ms var(--ease);
+}
+@media (hover: hover) and (pointer: fine) {
+  :root[data-ui-theme="rain"] :is(.btn, .ibtn, .icon-btn, .mini-tab, .ops-tag, .ops-scene, .ops-package):hover:not(:disabled) {
+    border-color: #c9fff4b3; transform: translateY(-1px);
+    box-shadow: inset 0 1px 2px #efffff99, 0 3px 9px #001f3059;
+  }
+  :root[data-ui-theme="rain"] :is(.btn, .ibtn, .icon-btn, .mini-tab, .ops-tag, .ops-scene, .ops-package):active:not(:disabled) { transform: scale(.97); }
+  :root[data-ui-theme="rain"] .btn.btn-stop:hover:not(:disabled) { border-color: var(--red); }
+}
+:root[data-ui-theme="rain"] :is(.modal-mask, .drawer-mask) { transition: opacity 200ms var(--ease); }
+:root[data-ui-theme="rain"] :is(.modal, .ops-panel) { transform: translateY(6px) scale(.98); transition: transform 200ms var(--ease); }
+:root[data-ui-theme="rain"] .modal-mask.open :is(.modal, .ops-panel) { transform: none; }
+:root[data-ui-theme="rain"] .drawer { transition: transform 250ms cubic-bezier(.32, .72, 0, 1); }
+/* Native popovers retain the top layer during their exit, including rapid reversals. */
+:root[data-ui-theme="rain"] :is(.ops-resource-popover, .ops-preset-popover, .ops-alert-popover, #rainTooltip) {
+  --rain-popover-shift: -3px;
+  opacity: 0; transform: translateY(var(--rain-popover-shift)) scale(.98); transform-origin: top left;
+  transition: opacity 160ms var(--ease), transform 160ms var(--ease), display 160ms allow-discrete, overlay 160ms allow-discrete;
+}
+:root[data-ui-theme="rain"] :is([data-rain-side="top"], #rainTooltip[data-side="top"]) { --rain-popover-shift: 3px; }
+:root[data-ui-theme="rain"] :is(.ops-resource-popover, .ops-preset-popover, .ops-alert-popover, #rainTooltip):popover-open { opacity: 1; transform: none; }
+@starting-style {
+  :root[data-ui-theme="rain"] :is(.ops-resource-popover, .ops-preset-popover, .ops-alert-popover, #rainTooltip):popover-open { opacity: 0; transform: translateY(var(--rain-popover-shift)) scale(.98); }
+}
+#rainTooltip {
+  position: fixed; inset: auto; margin: 0; max-width: min(280px, calc(100vw - 16px)); box-sizing: border-box;
+  padding: 8px 12px; border: 1px solid var(--line-2); border-radius: 12px;
+  background: var(--rain-panel); color: var(--ink); box-shadow: var(--shadow-lg); backdrop-filter: blur(12px);
+  font: 12px/1.5 var(--font-sans); overflow-wrap: anywhere; white-space: pre-line;
+}
+:root[data-ui-theme="rain"] #rainTooltip { transition-duration: 125ms; }
+:root[data-ui-theme="rain"] #rainTooltip[data-instant="true"] { transition-duration: 0ms; }
+:root[data-ui-theme="rain"][data-rain-input="keyboard"] { --card-flip-out-ms: 0; --card-flip-in-ms: 0; }
+:root[data-ui-theme="rain"][data-rain-input="keyboard"] :is(.rail-btn, .ops-tag, .ops-scene, .mini-tab)::after { transition: none; }
+:root[data-ui-theme="rain"][data-rain-input="keyboard"] :is(.modal-mask, .drawer-mask, .modal, .ops-panel, .drawer, [popover]) { transition-duration: 0ms; }
+:root[data-ui-theme="rain"][data-rain-input="keyboard"] .view.active :is(.app-head, .app-actions, .center-section > h3, .view-head, .folder-name) { animation: none; }
+@media (prefers-reduced-motion: reduce) {
+  #rainDrops { display: none; }
+  :root[data-ui-theme="rain"] :is(.btn, .ibtn, .icon-btn, .mini-tab, .ops-tag, .ops-scene, .ops-package, .rail-btn):is(:hover, :active):not(:disabled) { transform: none; }
+  :root[data-ui-theme="rain"] :is(.modal, .ops-panel) { transform: none; }
+  :root[data-ui-theme="rain"] :is(.drawer, [popover]) { transition-duration: 0ms; }
+  :root[data-ui-theme="rain"] :is(.ops-resource-popover, .ops-preset-popover, .ops-alert-popover, #rainTooltip):popover-open { transform: none; }
+  :root[data-ui-theme="rain"] .view.active :is(.app-head, .app-actions, .center-section > h3, .view-head, .folder-name) { animation: none; }
+  :root[data-ui-theme="rain"] :is(.rail-btn, .ops-tag, .ops-scene, .mini-tab)::after { transform: none; transition: opacity 160ms ease; }
+  :root[data-ui-theme="rain"] :is(.app-card, .folder-card)::before { transform: rotate(var(--water-tilt)); transition: opacity 160ms ease; }
+  :root[data-ui-theme="rain"] :is(.app-card, .folder-card):hover::before { transform: rotate(var(--water-tilt)); }
+  :root[data-ui-theme="rain"] :is(.app-card, .folder-card):hover::after { transform: rotate(-18deg); }
+}
+@media (prefers-reduced-transparency: reduce), (prefers-contrast: more), (forced-colors: active) {
+  :root { --card: #163643; --card-2: #214654; --rain-panel: #12303e; --line: #bddce8; }
+  #rainWallpaper, #rainDrops, #rainGlass, #rainMist { display: none; }
+  :root[data-ui-theme="rain"] body { background: var(--room); }
+  :root[data-ui-theme="rain"] :is(.rail, .topbar-inner, .ops-scenes, .app-card, .folder-card, .center-section, .widget, .ov, .file-filters, .file-table-panel, .tbl) { background: var(--card); backdrop-filter: none; }
+  :root[data-ui-theme="rain"] :is(.app-card, .folder-card)::before,
+  :root[data-ui-theme="rain"] :is(.app-card, .folder-card)::after { display: none; }
+}

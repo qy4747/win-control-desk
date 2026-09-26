@@ -1,0 +1,163 @@
+/* Copy the whole pack. Selectors do not contain its folder id. */
+@import url('../../elements.css');
+
+:root {
+  --element-background: url('./assets/paper.webp');
+  --element-chrome: url('./assets/paper.webp');
+  --element-panel: url('./assets/paper.webp');
+  --element-card: url('./assets/card.png');
+  --element-card-alt: url('./assets/card-perforated.png');
+  --element-control: url('./assets/strip.png');
+  --element-decor-a: url('./assets/clip.png');
+  --element-decor-b: url('./assets/binder.png');
+  --element-decor-c: url('./assets/pin.png');
+  --element-radius: 5px;
+  --tag-drawer-duration: 220ms; --tag-drawer-closed: translateY(-12px) rotateX(-8deg);
+  --paper-surface-filter: brightness(1);
+  --room: #b8c4b5; --card: #faf3e6; --card-2: #eee3ce;
+  --ink: #302c25; --ink-2: #51493e; --ink-3: #655b4d; --ink-4: #716655;
+  --line: #a58e694d; --line-2: #8a704d8c;
+  --accent: #286794; --accent-ink: var(--accent); --on-accent: #fff;
+  --green: #287052; --red: #b53830; --amber: #956017; --purple: #73518f;
+  --shadow: 0 2px 5px #49351b24, 0 8px 18px #49351b0d;
+  --shadow-lg: 0 7px 20px #49351b35;
+  --focus-ring: 0 0 0 3px #28679466;
+}
+:root[data-theme="dark"] {
+  --room: #242b28; --card: #303832; --card-2: #29312c;
+  --ink: #f6eedc; --ink-2: #dfd4c0; --ink-3: #c3b8a4; --ink-4: #b6ac99;
+  --line: #e6d9ba38; --line-2: #e6d9ba66;
+  --accent: #9cc8e3; --on-accent: #162d3a;
+  --green: #8ed7b1; --red: #ffaaa0; --amber: #ebcb8c; --purple: #ccb1ee;
+  --shadow: 0 3px 10px #0005; --shadow-lg: 0 7px 22px #0007;
+  --focus-ring: 0 0 0 3px #9cc8e380;
+  /* Only the paper darkens; live text and app icons keep their colors. */
+  --paper-surface-filter: brightness(.23) saturate(.55);
+}
+
+/* Relative URLs must be consumed here so copied packs resolve their own assets. */
+:root[data-ui-theme^="pack-"] body {
+  background-image: var(--element-background); background-size: 256px;
+  background-repeat: repeat; background-blend-mode: multiply;
+}
+:root[data-ui-theme^="pack-"] :is(.rail, .topbar) {
+  background-image: var(--element-chrome); background-blend-mode: multiply;
+}
+:root[data-ui-theme^="pack-"] :is(.ops-scenes, .center-section, .widget, .ov, .file-filters, .file-table-panel, .tbl, .modal, .drawer, .palette, .ops-panel, .ops-menu, .folder-menu-actions, .ops-alert-popover, .ops-resource-popover, .ops-preset-popover) {
+  background-image: var(--element-panel); background-blend-mode: multiply;
+}
+:root[data-ui-theme^="pack-"] .ops-more > .ops-menu { background-image: none; }
+/* The card itself supports clicking and Enter; no duplicate flip/back label. */
+:root[data-ui-theme^="pack-"] .ops-more > summary { display: none; }
+:root[data-ui-theme^="pack-"] .app-head { padding-right: 0; }
+/* Only the status line shares space with the existing application-kind label. */
+:root[data-ui-theme^="pack-"] .app-status { padding-right: 40px; }
+:root[data-ui-theme^="pack-"] .rail .side-brand { position: relative; isolation: isolate; }
+:root[data-ui-theme^="pack-"] .rail .side-brand::before {
+  content: ''; position: absolute; inset: -5px 10px 13px; z-index: -1; pointer-events: none;
+  border-image: var(--element-control) 30 80 30 80 fill / 8px 18px / 0 stretch;
+  filter: var(--paper-surface-filter) drop-shadow(0 2px 2px #49351b35);
+}
+:root[data-ui-theme^="pack-"] .rail .side-brand::after {
+  content: ''; position: absolute; right: 16px; top: -13px; width: 18px; height: 28px;
+  background: var(--element-decor-b) center / contain no-repeat; pointer-events: none;
+}
+
+/* Large sheets and section paper were missing from the first material pass. */
+:root[data-ui-theme^="pack-"] :is(.main-inner, .center-section, .ops-scenes, .rail-foot, #view-services > .panel) {
+  position: relative; isolation: isolate; background: transparent; box-shadow: none;
+}
+:root[data-ui-theme^="pack-"] :is(.main-inner, .center-section, .ops-scenes, .rail-foot, #view-services > .panel)::before {
+  content: ''; position: absolute; inset: -2px; z-index: -1; pointer-events: none;
+  border: solid transparent; border-width: 24px 36px 18px 18px;
+  border-image: var(--element-card) 80 120 60 60 / 24px 36px 18px 18px / 0 stretch;
+  background: var(--element-panel) repeat; background-size: 256px; background-clip: padding-box;
+  filter: var(--paper-surface-filter) drop-shadow(0 3px 3px #49351b30);
+}
+:root[data-ui-theme^="pack-"] .main-inner::before {
+  inset: -6px -10px 18px;
+  background-color: #e6dcca; background-blend-mode: multiply;
+  filter: var(--paper-surface-filter) drop-shadow(5px 5px 0 #b8a88f) drop-shadow(1px 3px 4px #49351b30);
+}
+:root[data-ui-theme^="pack-"] :is(.center-section, .ops-scenes, .rail-foot) { border-color: transparent; }
+:root[data-ui-theme^="pack-"] .rail-foot::before {
+  inset: 6px 10px; transform: rotate(-3deg);
+  background: #ebce89 var(--element-panel) center / 256px; background-blend-mode: multiply;
+  border: 0; border-image: none; mask: var(--element-card) center / 100% 100% no-repeat;
+}
+:root[data-ui-theme^="pack-"] :is(.view-head h2, .center-section h3) {
+  width: fit-content; padding: 6px 12px;
+  background: var(--element-control) center / 100% 100% no-repeat;
+}
+:root[data-ui-theme^="pack-"][data-theme="dark"] :is(.view-head h2, .center-section h3) { background-image: none; }
+:root[data-ui-theme^="pack-"] :is(input:not([type="checkbox"]):not([type="range"]), select, textarea, .theme-choice, .ibtn, .icon-btn) {
+  background: var(--card-2) var(--element-panel) repeat; background-size: 256px;
+  background-blend-mode: multiply; border-radius: 4px;
+}
+
+/* Nine-slice paper preserves folds. Menus, focus and drag hit areas stay intact. */
+:root[data-ui-theme^="pack-"] :is(.app-card, .folder-card) {
+  isolation: isolate; background: transparent; border-color: transparent; box-shadow: none;
+}
+:root[data-ui-theme^="pack-"] :is(.app-card, .folder-card)::before {
+  z-index: -1; inset: -3px; border: 0; border-radius: 0;
+  border-image: var(--element-card) 80 120 60 60 fill / 24px 36px 18px 18px / 0 stretch;
+  filter: var(--paper-surface-filter) drop-shadow(0 3px 2px #49351b38);
+}
+:root[data-ui-theme^="pack-"] :is(.app-card, .folder-card):nth-child(3n + 2)::before { transform: rotate(.45deg); }
+:root[data-ui-theme^="pack-"] :is(.app-card, .folder-card):nth-child(3n)::before { transform: rotate(-.4deg); }
+:root[data-ui-theme^="pack-"] :is(.app-card, .folder-card):nth-child(4n + 3)::before {
+  border-image: var(--element-card-alt) 50 40 30 48 fill / 18px 14px 10px 17px / 0 stretch;
+}
+/* Small pieces of real paper replace the placeholder sticker icons. */
+:root[data-ui-theme^="pack-"] :is(.app-card, .folder-card)::after {
+  top: -9px; right: 20px; width: 52px; height: 17px;
+  background: #acb9a0 var(--element-control) center / 100% 100% no-repeat;
+  background-blend-mode: multiply;
+  mask: var(--element-control) center / 100% 100% no-repeat;
+  transform: rotate(13deg); opacity: .8;
+}
+:root[data-ui-theme^="pack-"] :is(.app-card, .folder-card):nth-child(4n + 2)::after {
+  right: auto; left: -7px; top: -12px; width: 30px; height: 44px;
+  background: var(--element-decor-a) center / contain no-repeat;
+  mask: none; transform: none; opacity: 1;
+}
+:root[data-ui-theme^="pack-"] :is(.app-card, .folder-card):nth-child(4n + 3)::after {
+  left: auto; right: 14px; top: -11px; width: 17px; height: 28px;
+  background: var(--element-decor-c) center / contain no-repeat;
+  mask: none; transform: rotate(10deg); opacity: 1;
+}
+:root[data-ui-theme^="pack-"] :is(.app-card, .folder-card):nth-child(4n)::after {
+  left: 13px; right: auto; top: -22px; width: 26px; height: 40px;
+  background: var(--element-decor-b) center / contain no-repeat;
+  mask: none; transform: rotate(-5deg); opacity: 1;
+}
+
+/* Paper tabs use semantic state colors, never baked-in text. */
+:root[data-ui-theme^="pack-"] :is(button.btn, .ops-add > summary, .rail-btn, .mini-tab, .ops-tag, .ops-scene, .ops-package) {
+  isolation: isolate; position: relative; background: transparent;
+  border-color: transparent; box-shadow: none;
+}
+:root[data-ui-theme^="pack-"] :is(button.btn, .ops-add > summary, .rail-btn, .mini-tab, .ops-tag, .ops-scene, .ops-package)::before {
+  content: ''; position: absolute; inset: -1px; z-index: -1; pointer-events: none;
+  background: var(--paper-control-color, var(--card-2)) var(--element-control) center / 100% 100% no-repeat;
+  background-blend-mode: multiply;
+  mask: var(--element-control) center / 100% 100% no-repeat;
+}
+:root[data-ui-theme^="pack-"] :is(.btn-accent, .rail-btn.active, .mini-tab.active, .ops-tag[aria-pressed="true"], .ops-scene[aria-pressed="true"]) {
+  --paper-control-color: var(--accent); color: var(--on-accent);
+}
+:root[data-ui-theme^="pack-"] .ops-scene.is-current { border-bottom: 3px solid var(--accent); }
+:root[data-ui-theme^="pack-"] :is(button.btn, .ops-add > summary, .rail-btn, .mini-tab, .ops-tag, .ops-scene, .ops-package):focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 3px;
+}
+
+:root[data-ui-theme^="pack-"] #view-services .tbl { box-shadow: none; background-image: none; }
+@media (prefers-contrast: more), (forced-colors: active) {
+  :root[data-ui-theme^="pack-"] :is(.main-inner, .center-section, .ops-scenes, .rail-foot, #view-services > .panel) { background: var(--card); }
+  :root[data-ui-theme^="pack-"] :is(.main-inner, .center-section, .ops-scenes, .rail-foot, #view-services > .panel)::before { display: none; }
+  :root[data-ui-theme^="pack-"] :is(.app-card, .folder-card, button.btn, .ops-add > summary, .rail-btn, .mini-tab, .ops-tag, .ops-scene, .ops-package) { background: var(--card); border: 1px solid currentColor; }
+  :root[data-ui-theme^="pack-"] :is(.app-card, .folder-card, button.btn, .ops-add > summary, .rail-btn, .mini-tab, .ops-tag, .ops-scene, .ops-package)::before { display: none; }
+  :root[data-ui-theme^="pack-"] :is(.app-card, .folder-card)::after { display: none; }
+  :root[data-ui-theme^="pack-"] :is(.btn-accent, .rail-btn.active, .mini-tab.active, .ops-tag[aria-pressed="true"], .ops-scene[aria-pressed="true"]) { background: var(--accent); }
+}

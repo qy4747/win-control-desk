@@ -1,0 +1,27 @@
+/* Shared settings control: available in every skin. */
+.theme-choices { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; margin: 16px 0 22px; }
+.theme-choice { position: relative; min-width: 0; padding: 9px; text-align: left; border: 2px solid var(--line); border-radius: 14px; color: var(--ink); background: transparent; }
+.theme-choice[aria-pressed="true"] { border-color: var(--accent); }
+.theme-choice[aria-pressed="true"]::after { content: '✓'; position: absolute; top: 16px; right: 16px; width: 20px; height: 20px; display: grid; place-items: center; border-radius: 50%; background: var(--accent); color: var(--on-accent); font-size: 12px; }
+.theme-choice:disabled { cursor: wait; }
+.theme-choice:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.theme-choice strong { display: block; margin: 10px 3px 3px; font-size: 14px; }
+.theme-choice small { display: block; margin: 0 3px 3px; color: var(--ink-2); font-size: 11px; line-height: 1.5; }
+.theme-preview { display: grid; grid-template-columns: 18px 1fr 1fr; grid-template-rows: 18px 1fr 1fr; gap: 6px; padding: 10px; height: 110px; border-radius: 8px; background: #eef2f6; }
+.theme-preview i { display: block; border: 1px solid #cbd4e0; border-radius: 4px; background: #fff; }
+.theme-preview i:first-child { grid-row: 1 / 4; }
+.theme-preview i:nth-child(2) { grid-column: 2 / 4; }
+.theme-preview-image { display: block; padding: 0; overflow: hidden; }
+.theme-preview-image img { width: 100%; height: 100%; object-fit: cover; }
+.theme-choice[data-theme-id="apple"] .theme-preview { background: #cedae6 url('/assets/apple-architecture.png') center / cover; }
+.theme-choice[data-theme-id="apple"] .theme-preview i { background: #ffffff80; border-color: #ffffffb3; backdrop-filter: blur(2px); }
+.theme-choice[data-theme-id="rain"] .theme-preview { background: #173c49 url('/assets/rain-courtyard.webp') center / cover; }
+.theme-choice[data-theme-id="rain"] .theme-preview i { background: #123d554a; border-color: #cefaff9e; border-radius: 8px; box-shadow: inset 0 1px 2px #d9ffffa6; }
+.wallpaper-settings:not([hidden]) { display: flex; align-items: center; flex-wrap: wrap; gap: 16px; margin: 0 0 22px; }
+.wallpaper-preview { width: 144px; height: 90px; object-fit: cover; border: 1px solid var(--line); border-radius: 10px; }
+.wallpaper-settings strong { font-size: 13px; }
+.wallpaper-settings p { margin: 6px 0; font-size: 12px; color: var(--ink-2); }
+.wallpaper-settings p:empty { display: none; }
+.wallpaper-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.rain-mist-control:not([hidden]) { display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: 13px; cursor: pointer; }
+.rain-mist-control input { accent-color: var(--accent); }

@@ -1,0 +1,684 @@
+/* ============================================================
+   主题无关的行为层
+   承载结构、布局、显隐及可访问性；颜色、字体、边框与动效外观见 themes/ops.css。
+   ============================================================ */
+
+.sr-only {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0, 0, 0, 0) !important;
+  clip-path: inset(50%) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+}
+
+.field-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.field-head label {
+  margin-bottom: 0 !important;
+}
+
+.appearance-details {
+  margin: 2px 0 16px;
+}
+
+.appearance-details summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 48px;
+  padding: 10px 12px;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.appearance-details summary::-webkit-details-marker { display: none; }
+.appearance-details summary::marker { content: ''; }
+
+.appearance-details[open] summary {
+  margin-bottom: 12px;
+}
+
+.appearance-summary-main,
+.appearance-disclosure {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.appearance-summary-main { gap: 9px; }
+.appearance-disclosure {
+  flex: none;
+  gap: 6px;
+}
+
+.appearance-disclosure-open { display: none; }
+.appearance-details[open] .appearance-disclosure-closed { display: none; }
+.appearance-details[open] .appearance-disclosure-open { display: inline; }
+
+.appearance-chevron {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+}
+
+.appearance-details[open] .appearance-chevron {
+  transform: rotate(180deg);
+}
+
+.appearance-details .field {
+  margin-bottom: 0;
+}
+
+.tbl { position: relative; }
+
+.c-port-cell {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  min-width: 0;
+}
+
+.port-discovery {
+  margin-top: 16px;
+  overflow: hidden;
+}
+
+.port-discovery-head {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 12px 14px;
+}
+
+.port-discovery-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+}
+
+.port-discovery-head > div {
+  min-width: 0;
+  flex: 1;
+}
+
+.port-discovery-head h3,
+.port-discovery-head p { margin: 0; }
+
+.port-discovery-head p {
+  margin-top: 2px;
+}
+
+.port-discovery-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  min-width: 25px;
+  height: 25px;
+  padding-inline: 7px;
+}
+
+.port-discovery-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.port-discovery-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 16px;
+  padding: 13px 14px;
+}
+
+.port-discovery-copy { min-width: 0; }
+
+.port-discovery-title-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+
+.port-discovery-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.port-discovery-status { flex: none; }
+
+.port-discovery-meta,
+.port-discovery-detail {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.port-discovery-meta { margin-top: 3px; }
+.port-discovery-detail { margin-top: 2px; }
+
+.port-discovery-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.port-discovery-actions .btn {
+  height: 32px;
+  padding-inline: 13px;
+}
+
+#logBody[aria-busy="true"],
+#appDiagList[aria-busy="true"] {
+  cursor: progress;
+}
+
+.appdiag-repair { margin-top: 10px; }
+
+@media (hover: none), (pointer: coarse) {
+  /* 触屏设备没有 hover，行操作必须始终可发现。 */
+  .tbl-body .c-act,
+  .app-sub-actions { opacity: 1; }
+}
+
+@media (pointer: coarse) {
+  /* 常用操作使用适合手指的命中区域，卡片副操作换行避免挤出窄屏。 */
+  .ibtn,
+  .icon-btn,
+  .drawer-close {
+    width: 40px;
+    min-width: 40px;
+    height: 40px;
+    min-height: 40px;
+  }
+
+  .btn,
+  .nav-btn,
+  .console-control,
+  .cmdk-trigger,
+  .kind-btn,
+  .hero-add {
+    min-height: 40px;
+  }
+
+  .st-port,
+  .c-port {
+    min-width: 44px;
+    min-height: 36px;
+  }
+
+  .chip {
+    min-height: 40px;
+    height: auto;
+  }
+
+  .chip button {
+    width: 32px;
+    min-width: 32px;
+    height: 32px;
+    min-height: 32px;
+  }
+
+  .app-actions { flex-wrap: wrap; }
+  .app-sub-actions {
+    flex-basis: 100%;
+    justify-content: flex-end;
+    margin-left: 0;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .tbl-body .c-act { gap: 6px; }
+}
+
+@media (max-width: 680px) {
+  /* 手机宽度使用真正可收缩的单列网格。 */
+  .app-grid { grid-template-columns: minmax(0, 1fr); }
+  .app-card,
+  .add-card { min-width: 0; }
+
+  .modal-mask { padding: 12px; }
+  .modal {
+    max-height: calc(100dvh - 24px);
+    padding: 22px 18px 18px;
+  }
+  .input-row {
+    flex-wrap: wrap;
+  }
+  .input-row input {
+    min-width: 0;
+    flex-basis: 200px;
+  }
+  .input-row .btn {
+    flex: 1 0 auto;
+  }
+  .glyph-grid {
+    grid-template-columns: repeat(6, minmax(36px, 1fr));
+  }
+  .modal-actions { flex-wrap: wrap; }
+
+  .port-discovery-head { align-items: flex-start; }
+  .port-discovery-item {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 11px;
+  }
+  .port-discovery-actions { justify-content: flex-start; }
+
+  /* 桌面表格在手机宽度改为信息卡；端口与危险操作始终保留。 */
+  .tbl .tr.th {
+    position: absolute !important;
+    width: 1px !important;
+    height: 1px !important;
+    padding: 0 !important;
+    margin: -1px !important;
+    overflow: hidden !important;
+    clip: rect(0, 0, 0, 0) !important;
+    clip-path: inset(50%) !important;
+    white-space: nowrap !important;
+    border: 0 !important;
+  }
+  .tbl .tr.th > * { display: block !important; }
+
+  .tbl:not(.tbl-watch) .tbl-body .tr {
+    grid-template-columns: 18px minmax(0, 1fr) auto auto;
+    grid-template-areas:
+      "dot title port status"
+      ". load load uptime"
+      ". actions actions actions"
+      "command command command command";
+    gap: 8px 10px;
+    min-height: 0;
+    padding: 12px;
+  }
+  .tbl:not(.tbl-watch) .tbl-body .c-dot { grid-area: dot; }
+  .tbl:not(.tbl-watch) .tbl-body .c-title { grid-area: title; }
+  .tbl:not(.tbl-watch) .tbl-body .c-port-cell {
+    grid-area: port;
+    justify-self: end;
+  }
+  .tbl:not(.tbl-watch) .tbl-body .c-status {
+    grid-area: status;
+    justify-self: end;
+  }
+  /* 目录与 PID 不占手机卡片空间，但仍留在可访问性树中。 */
+  .tbl:not(.tbl-watch) .tbl-body .c-cwd,
+  .tbl:not(.tbl-watch) .tbl-body .c-pid {
+    display: block !important;
+    position: absolute !important;
+    width: 1px !important;
+    height: 1px !important;
+    padding: 0 !important;
+    margin: -1px !important;
+    overflow: hidden !important;
+    clip: rect(0, 0, 0, 0) !important;
+    clip-path: inset(50%) !important;
+    white-space: nowrap !important;
+    border: 0 !important;
+  }
+  .tbl:not(.tbl-watch) .tbl-body .c-load {
+    grid-area: load;
+    min-width: 0;
+    flex-wrap: wrap;
+    row-gap: 3px;
+  }
+  .tbl:not(.tbl-watch) .tbl-body .c-up {
+    grid-area: uptime;
+    justify-self: end;
+  }
+  .tbl:not(.tbl-watch) .tbl-body .c-act {
+    grid-area: actions;
+    min-width: 0;
+    min-height: 32px;
+    flex-wrap: wrap;
+    opacity: 1;
+  }
+  .tbl:not(.tbl-watch) .tbl-body .tr-cmd {
+    grid-area: command;
+    grid-column: auto;
+    padding: 2px 0 0;
+  }
+
+  .tbl-watch .tbl-body .tr {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "title pid"
+      "load uptime"
+      "actions actions";
+    gap: 8px 12px;
+    min-height: 0;
+    padding: 12px;
+  }
+  .tbl-watch .tbl-body .w-title { grid-area: title; }
+  .tbl-watch .tbl-body .c-pid { grid-area: pid; }
+  .tbl-watch .tbl-body .c-load {
+    grid-area: load;
+    min-width: 0;
+    flex-wrap: wrap;
+  }
+  .tbl-watch .tbl-body .c-up {
+    grid-area: uptime;
+    justify-self: end;
+  }
+  .tbl-watch .tbl-body .c-act {
+    grid-area: actions;
+    min-height: 32px;
+    opacity: 1;
+  }
+
+  .port-discovery-actions .btn {
+    flex: 1 1 auto;
+  }
+}
+
+@media (max-width: 480px) {
+  .topbar-inner { padding-inline: 12px; }
+  .console-action-label { display: none; }
+  .console-control {
+    width: 40px;
+    padding-inline: 0;
+    justify-content: center;
+  }
+}
+
+@media (forced-colors: active) {
+  button:focus-visible,
+  input:focus-visible,
+  textarea:focus-visible,
+  a.icon-btn:focus-visible,
+  [tabindex]:focus-visible {
+    outline: 2px solid Highlight !important;
+    outline-offset: 2px;
+    box-shadow: none !important;
+  }
+
+  .app-sub-actions,
+  .tbl-body .c-act { opacity: 1; }
+}
+
+/* ============================================================
+   布局 v2 — 左侧导航轨 / 内容+右侧信息栏网格 / KPI 卡 / 过滤芯片
+   结构层：网格、尺寸和响应式布局；外观规则集中在 themes/ops.css。
+   ============================================================ */
+
+.shell { flex-direction: row; }
+.shell-col {
+  flex: 1; min-width: 0;
+  display: flex; flex-direction: column;
+  height: 100vh;
+}
+
+/* ---------- 左侧导航轨 ---------- */
+.rail {
+  flex: none; width: 88px;
+  display: flex; flex-direction: column;
+}
+.rail-nav {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 14px 10px;
+}
+.rail-btn {
+  display: flex; flex-direction: column; align-items: center; gap: 6px;
+  padding: 11px 4px 9px;
+}
+.rail-btn .ic svg { width: 19px; height: 19px; }
+.rail-foot {
+  margin-top: auto;
+  padding: 14px 10px 16px;
+  display: flex; flex-direction: column; align-items: center; gap: 5px;
+  text-align: center;
+}
+.rail-conn {
+  display: flex; align-items: center; gap: 5px;
+}
+
+/* ---------- 内容 + 右侧信息栏 ---------- */
+.main-inner {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  gap: 22px;
+  align-items: start;
+}
+.content { min-width: 0; }
+.side-widgets {
+  min-width: 0;
+  /* 与 .view-head 顶距一致，让首个部件与内容页头同一条水平线 */
+  padding-top: 30px;
+}
+.side-stack { display: flex; flex-direction: column; gap: 14px; }
+
+/* ---------- 侧栏小部件 ---------- */
+.widget {
+  padding: 13px 14px;
+}
+.widget-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  margin-bottom: 6px;
+}
+.widget-head h3 {
+  margin: 0;
+}
+
+.feed-list { display: flex; flex-direction: column; }
+.feed-item {
+  display: flex; align-items: flex-start; gap: 9px;
+  padding: 8px 0;
+}
+.feed-dot {
+  width: 7px; height: 7px; flex: none;
+  margin-top: 5px;
+}
+.feed-main { flex: 1; min-width: 0; }
+.feed-title {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.feed-sub {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.feed-time {
+  flex: none;
+  padding-top: 2px;
+}
+.feed-empty {
+  padding: 18px 4px; text-align: center;
+}
+
+.top5-list { display: flex; flex-direction: column; }
+.t5-row {
+  display: flex; align-items: center; gap: 9px;
+  padding: 7px 0;
+}
+.t5-rank {
+  flex: none; width: 14px;
+}
+.t5-port { flex: none; }
+.t5-name {
+  flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.t5-val { flex: none; }
+.t5-tag {
+  flex: none;
+  padding: 1px 6px;
+}
+.t5-bar {
+  flex: none; width: 52px; height: 3px;
+  overflow: hidden;
+}
+.t5-bar > i { display: block; height: 100%; }
+.t5-empty { padding: 14px 4px; text-align: center; }
+
+.mini-tabs { display: flex; gap: 4px; }
+.mini-tab {
+  padding: 2px 9px;
+}
+
+.quick-list { display: flex; flex-direction: column; gap: 6px; }
+.quick-item {
+  display: flex; align-items: center; gap: 9px;
+  padding: 9px 11px;
+}
+.quick-item kbd { margin-left: auto; }
+
+/* ---------- 日志中心 ---------- */
+.logs-list { display: flex; flex-direction: column; }
+.logs-item {
+  display: flex; align-items: center; gap: 10px;
+  width: 100%;
+  padding: 10px 2px;
+  text-align: left;
+}
+.logs-ic {
+  flex: none; width: 28px; height: 28px;
+  display: inline-flex; align-items: center; justify-content: center;
+  overflow: hidden;
+}
+.logs-ic img { width: 100%; height: 100%; object-fit: cover; }
+.logs-main { flex: 1; min-width: 0; }
+.logs-name {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.logs-sub {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.logs-empty { padding: 18px 4px; text-align: center; }
+
+/* ---------- 设置中心 ---------- */
+.set-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 14px;
+  padding: 12px 0;
+}
+.set-hint { margin-top: 2px; }
+.switch {
+  position: relative; flex: none;
+  width: 42px; height: 24px;
+}
+.switch i {
+  position: absolute; top: 2px; left: 2px;
+  width: 18px; height: 18px;
+}
+.switch.on i { transform: translateX(18px); }
+.set-info-list {
+  margin-top: 14px; padding-top: 10px;
+}
+.set-info {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 14px;
+  padding: 5px 0;
+}
+.set-path {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  max-width: 260px;
+}
+
+.tips-text { margin: 0; }
+.tips-ic { display: inline-flex; }
+.tips-action { margin-top: 10px; }
+
+/* ---------- KPI 卡（图标 + 数值 + 副标签 + 火花线） ---------- */
+.ov { display: flex; align-items: flex-start; gap: 12px; }
+.ov-body { flex: 1; min-width: 0; }
+.ov-icon {
+  flex: none; width: 34px; height: 34px;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.ov-sub {
+  margin-top: 3px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.spark { display: block; width: 100%; height: 26px; margin-top: 6px; }
+
+/* ---------- 视图页头右侧：搜索 + 快捷操作 ---------- */
+.vh-right { gap: 10px; }
+.quick-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.qa-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 30px; padding: 0 12px;
+}
+.qa-ic { display: inline-flex; }
+
+/* ---------- 分区过滤芯片（内嵌于分区标签行） ---------- */
+.sec-label { flex-wrap: wrap; row-gap: 8px; }
+.filter-row {
+  display: flex; gap: 6px; flex-wrap: wrap;
+  margin: 0;
+}
+.filter-row:empty { display: none; }
+@media (max-width: 900px) {
+  .sec-label .filter-row { flex-basis: 100%; margin: 2px 0 0; }
+}
+.fchip {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 27px; padding: 0 12px;
+}
+
+/* ---------- 表格新列（PID / 状态 / 负载条） ---------- */
+.tbl:not(.tbl-watch) .tr {
+  grid-template-columns: 26px minmax(150px, 1.5fr) 58px 74px minmax(100px, 1fr) 128px 62px 68px 146px;
+}
+/* 进程来源徽标（哪个应用/AI 助手启动了该服务） */
+.t-sub { display: flex; align-items: center; gap: 4px; }
+.t-sub-text {
+  min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.origin-ic {
+  flex: none;
+  display: inline-flex;
+}
+.status-pill {
+  display: inline-flex; align-items: center;
+  padding: 2px 8px;
+}
+.ld { flex-direction: column; align-items: stretch; gap: 1px; }
+.ld-bar {
+  display: block; width: 40px; height: 3px; overflow: hidden;
+}
+.ld-bar > i { display: block; height: 100%; }
+
+@media (max-width: 1400px) {
+  .tbl:not(.tbl-watch) .tr {
+    grid-template-columns: 26px minmax(140px, 1.4fr) 56px 70px minmax(90px, 0.9fr) 116px 58px 66px 136px;
+  }
+}
+
+/* ---------- 布局 v2 响应式 ---------- */
+@media (max-width: 1280px) {
+  .main-inner { grid-template-columns: minmax(0, 1fr); }
+  .side-widgets {
+    padding-top: 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 14px;
+  }
+  .side-stack { display: contents; }
+}
+@media (max-width: 1080px) {
+  .tbl:not(.tbl-watch) .tr {
+    grid-template-columns: 26px minmax(140px, 1.4fr) 56px 70px 116px 58px 66px 126px;
+  }
+  .tbl:not(.tbl-watch) .tr > .c-cwd { display: none; }
+}
+@media (max-width: 900px) {
+  .rail { display: none; }
+  .shell-col { height: auto; min-height: 100vh; }
+  .quick-actions { justify-content: flex-start; }
+}

@@ -1,0 +1,50 @@
+/* Copy this folder to add a skin. Keep the import; change assets and tokens only. */
+@import url('../../elements.css');
+
+:root {
+  --element-background: url('./assets/background.svg');
+  --element-chrome: url('./assets/chrome.svg');
+  --element-panel: url('./assets/panel.svg');
+  --element-card: url('./assets/card.svg');
+  --element-control: url('./assets/control.svg');
+  --element-frame: url('./assets/frame.svg');
+  --element-label-frame: url('./assets/label-frame.svg');
+  --element-decor-a: url('./assets/decor-a.svg');
+  --element-decor-b: url('./assets/decor-b.svg');
+  --element-decor-c: url('./assets/decor-c.svg');
+  --element-corner: url('./assets/corner.svg');
+
+  --room: #e5dccb; --card: #faf3e6; --card-2: #eee3ce;
+  --ink: #302c25; --ink-2: #51493e; --ink-3: #655b4d; --ink-4: #716655;
+  --line: #a58e694d; --line-2: #8a704d8c;
+  --accent: #286794; --accent-ink: var(--accent); --on-accent: #fff;
+  --green: #287052; --red: #b53830; --amber: #956017; --purple: #73518f;
+  --shadow: 0 2px 5px #49351b24, 0 8px 18px #49351b0d;
+  --shadow-lg: 0 7px 20px #49351b35;
+  --focus-ring: 0 0 0 3px #28679466;
+  --element-radius: 5px;
+  --tag-drawer-duration: 200ms; --tag-drawer-closed: translateY(-10px) rotateX(-5deg);
+}
+:root[data-theme="dark"] {
+  --room: #242b28; --card: #303832; --card-2: #29312c;
+  --ink: #f6eedc; --ink-2: #dfd4c0; --ink-3: #c3b8a4; --ink-4: #b6ac99;
+  --line: #e6d9ba38; --line-2: #e6d9ba66;
+  --accent: #9cc8e3; --on-accent: #162d3a;
+  --green: #8ed7b1; --red: #ffaaa0; --amber: #ebcb8c; --purple: #ccb1ee;
+  --shadow: 0 3px 10px #0005; --shadow-lg: 0 7px 22px #0007;
+  --focus-ring: 0 0 0 3px #9cc8e380;
+}
+
+/* Keep these bindings in the pack: CSS resolves a variable's relative URL where
+   it is used. Copy unchanged with the folder; geometry lives in elements.css. */
+:root[data-ui-theme^="pack-"] body { background-image: var(--element-background); }
+:root[data-ui-theme^="pack-"] :is(.rail, .topbar) { background-image: var(--element-chrome); }
+:root[data-ui-theme^="pack-"] :is(.ops-scenes, .center-section, .widget, .ov, .file-filters, .file-table-panel, .tbl, .modal, .drawer, .palette, .ops-panel, .ops-menu, .folder-menu-actions, .ops-alert-popover, .ops-resource-popover, .ops-preset-popover) { background-image: var(--element-panel); }
+:root[data-ui-theme^="pack-"] :is(.app-card, .folder-card) { background-image: var(--element-card); }
+:root[data-ui-theme^="pack-"] :is(.app-card, .folder-card)::before { border-image-source: var(--element-frame); }
+:root[data-ui-theme^="pack-"] :is(.app-card, .folder-card)::after { background-image: var(--element-decor-a); }
+:root[data-ui-theme^="pack-"] :is(.app-card, .folder-card):nth-child(3n + 2)::after { background-image: var(--element-decor-b); }
+:root[data-ui-theme^="pack-"] :is(.app-card, .folder-card):nth-child(3n)::after { background-image: var(--element-decor-c); }
+:root[data-ui-theme^="pack-"] .rail-foot::after { background-image: var(--element-corner); }
+:root[data-ui-theme^="pack-"] :is(.btn, .ibtn, .icon-btn, .rail-btn, .mini-tab, .ops-tag, .ops-scene, .ops-package, .ops-picker-choice, .ops-preset-app-toggle) { background-image: var(--element-control); border-image-source: var(--element-label-frame); }
+:root[data-ui-theme^="pack-"] .ops-more > .ops-menu { background-image: none; }
