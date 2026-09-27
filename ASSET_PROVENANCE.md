@@ -60,3 +60,15 @@
 - `static/themes/packs/journal/assets/label-frame.svg` — SHA-256 `2305cbac66a39026025490a48ce87ea84041e2b6dd2022ae8e273dbdb9909bd6`
 - `static/themes/packs/journal/assets/panel.svg` — SHA-256 `8c1f9437b4eb436a10be5409f73fa6e1828cc86680053d74f36f6e031e946fc6`
 - `static/themes/packs/journal/preview.svg` — SHA-256 `ed7246950ed1e3af4339683f503a5a1ec8c1e4d9c9bafd85b8c47d78bcec0715`
+
+### README 界面截图
+- 状态：`CLEARED`
+- 来源：本仓库页面在 Edge 中的实际截图，1440 × 960，使用 `tools/ui_demo.py` 的虚构演示数据；不读取个人配置，保留底部演示标识。Apple 与雨境加载随库默认壁纸。
+- 用途：README 主题对比与服务监控预览。界面代码适用项目 MIT 声明，截图中的字体、图标及主题素材沿用本台账与第三方声明中的对应来源和许可。
+- `docs/screenshots/apple-launchpad.jpg` — SHA-256 `398474ae8502bdcbfb76f44552e8fb339e780a3bdff165bb4b6eaefaa175dd6e`
+- `docs/screenshots/celadon-launchpad.jpg` — SHA-256 `776b760f89775ff6c04c1fcf55abfd5f0d2def6176af7e6e2e71a8920602e57e`
+- `docs/screenshots/journal-launchpad.jpg` — SHA-256 `e4ce66113c563bba6a5dcf3ee468582a5e298548c46dd815b3a6bd6f73a900f5`
+- `docs/screenshots/ops-launchpad.jpg` — SHA-256 `d8ce0631c5c7bc85f312890f90151946b5131825a3cd0f6ad1227e6ddeca586d`
+- `docs/screenshots/ops-services.jpg` — SHA-256 `4e95b7d038362bc2898bbe1c30dea80026d66d95b60d7b3c814989e47acea33c`
+- `docs/screenshots/papercut-launchpad.jpg` — SHA-256 `0b2b01b7c96e402fb622249d87ca4cbf94c078e6751c51525b7d2e38844c9f99`
+- `docs/screenshots/rain-launchpad.jpg` — SHA-256 `f230713247920690665e9cc1ad825df931777a1b0c2f8e88f9bc0b28e0b68555`

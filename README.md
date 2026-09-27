@@ -20,11 +20,26 @@
 
 ## 界面预览
 
-截图使用虚构演示数据。
+以下为六个主题的浏览器实际截图，使用同一组虚构演示数据（1440 × 960）。点击图片可查看原图。
 
-| 启动台 | 服务监控 |
+| 极简 · 浅色 | Apple · 浅色 |
 | --- | --- |
-| ![启动台演示](docs/screenshots/ops-launchpad.jpg) | ![服务监控演示](docs/screenshots/ops-services.jpg) |
+| ![极简主题启动台](docs/screenshots/ops-launchpad.jpg) | ![Apple 主题启动台](docs/screenshots/apple-launchpad.jpg) |
+
+| 雨境 · 深色 | 青瓷 · 浅色 |
+| --- | --- |
+| ![雨境主题启动台](docs/screenshots/rain-launchpad.jpg) | ![青瓷主题启动台](docs/screenshots/celadon-launchpad.jpg) |
+
+| 剪纸 · 浅色 | Journal · 素材框架示例 |
+| --- | --- |
+| ![剪纸主题启动台](docs/screenshots/papercut-launchpad.jpg) | ![Journal 素材框架启动台](docs/screenshots/journal-launchpad.jpg) |
+
+<details>
+<summary>服务监控预览（极简主题）</summary>
+
+![服务监控演示](docs/screenshots/ops-services.jpg)
+
+</details>
 
 ## Windows 安装与启动
 
