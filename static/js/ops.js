@@ -343,6 +343,11 @@ function openAlerts(target) {
 }
 function renderAlerts() {
   if (!alertTarget) return;
+  // 轮询更新读数时复用折叠分组；标题及目录完整路径在此面板内唯一。
+  const sections = new Map([...content.querySelectorAll('.ops-section')]
+    .map(node => [node.firstElementChild.textContent, node]));
+  const focused = content.contains(document.activeElement) ? document.activeElement : null;
+  const scroll = content.scrollTop;
   const data = state.data || {};
   const app = data.apps?.find(a => a.id === alertTarget);
   const alerts = alertTarget === 'system' ? (data.alerts || []).filter(a => a.target === 'system' && !a.ignored) : appAlerts(app);
@@ -371,6 +376,14 @@ function renderAlerts() {
   content.append(button('设置长期静音规则', () => alertTarget === 'system' ? openRules() : openDetails(app.id)));
   const events = section(content, '最近事件');
   note(events, (data.events || []).filter(e => e.target === alertTarget).slice(0, 30).map(e => new Date(e.at * 1000).toLocaleString() + ' · ' + e.title + ' · ' + e.detail).join('\n') || '暂无事件');
+  for (const updated of content.querySelectorAll('.ops-section')) {
+    const previous = sections.get(updated.firstElementChild.textContent);
+    if (!previous) continue;
+    previous.replaceChildren(previous.firstElementChild, ...[...updated.children].slice(1));
+    updated.replaceWith(previous);
+  }
+  if (focused?.isConnected) focused.focus({ preventScroll: true });
+  content.scrollTop = scroll;
 }
 
 async function executeAction(appId, action) {
