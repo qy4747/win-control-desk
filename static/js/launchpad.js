@@ -795,15 +795,18 @@ function announceReorder(message) {
 }
 
 /* FLIP 让位动画：重排前记录视觉位置，重排后从旧位置滑到新位置。 */
+function stopFlip(card) {
+  cancelAnimationFrame(card._flipFrame);
+  clearTimeout(card._flipT);
+  card.style.transition = 'none';
+  card.style.transform = 'none';
+}
+
 function flip(grid, mutate) {
   if (reduceMotion) { mutate(); return; }
-  const cards = [...grid.querySelectorAll('.app-card, .drop-placeholder')];
+  const cards = [...grid.querySelectorAll('.app-card')];
   const first = new Map(cards.map(c => [c, c.getBoundingClientRect()]));
-  for (const c of cards) {
-    clearTimeout(c._flipT);
-    c.style.transition = 'none';
-    c.style.transform = 'none';
-  }
+  for (const c of cards) stopFlip(c);
   mutate();
   const moved = [];
   for (const c of cards) {
@@ -818,15 +821,14 @@ function flip(grid, mutate) {
       c.style.transform = '';
     }
   }
-  if (!moved.length) return;
-  requestAnimationFrame(() => {
-    for (const c of moved) {
+  for (const c of moved) {
+    c._flipFrame = requestAnimationFrame(() => {
       c.style.transition = 'var(--reorder-transition)';
       c.style.transform = '';
       const duration = parseFloat(getComputedStyle(c).getPropertyValue('--reorder-duration-ms')) || 0;
       c._flipT = setTimeout(() => { c.style.transition = ''; c.style.transform = ''; }, duration + 20);
-    }
-  });
+    });
+  }
 }
 
 function cardPointerDown(e) {
@@ -872,6 +874,7 @@ function beginDrag(card, e) {
   const menu = card.querySelector('.ops-more'); if (menu) menu.open = false;
   const grid = card.parentNode;
   const rect = card.getBoundingClientRect();
+  stopFlip(card);                    // 接管位移，旧动画不能再清除拖拽坐标
   card.classList.remove('anim-in');
   const originIndex = gridAppCards(grid).indexOf(card);
   const ph = el('div', 'drop-placeholder');
@@ -886,7 +889,7 @@ function beginDrag(card, e) {
   s.top = '0';
   s.margin = '0';
   s.zIndex = '200';
-  s.pointerEvents = 'none';          // 穿透，便于 elementFromPoint 找目标
+  s.pointerEvents = 'none';
   card.classList.add('lifted');
   document.body.classList.add('dragging-on');
   drag = {
@@ -901,19 +904,23 @@ function moveDrag(e) {
   const d = drag;
   d.card.style.transform =
     'translate(' + (e.clientX - d.dx) + 'px,' + (e.clientY - d.dy) + 'px)';
-  const hit = document.elementFromPoint(e.clientX, e.clientY);
-  const over = hit && hit.closest('.app-card');
-  if (over && d.grid.contains(over) && !over.classList.contains('add-card')) {
-    /* 用布局坐标（offsetLeft，不含 FLIP transform）判定插入侧，
-       避免让位动画中的视觉位置抖动导致占位框来回振荡 */
-    const baseX = over.offsetParent.getBoundingClientRect().left;
-    const midX = over.offsetLeft + over.offsetWidth / 2;
-    const before = (e.clientX - baseX) < midX;
+  // 占位框不参与动画；用它将指针转换成同网格的布局坐标（含滚动偏移）。
+  // 不命中正在让位的视觉表面，否则跨行时会反复选中不同卡片。
+  const origin = d.ph.getBoundingClientRect();
+  const x = e.clientX - origin.left + d.ph.offsetLeft;
+  const y = e.clientY - origin.top + d.ph.offsetTop;
+  const over = [...d.grid.children].find(c => c.offsetWidth && c.offsetHeight
+    && x >= c.offsetLeft && x < c.offsetLeft + c.offsetWidth
+    && y >= c.offsetTop && y < c.offsetTop + c.offsetHeight);
+  if (!over || over === d.ph) return;
+  if (over.matches('.app-card[data-key]')) {
+    const before = over.offsetTop < d.ph.offsetTop
+      || (over.offsetTop === d.ph.offsetTop && over.offsetLeft < d.ph.offsetLeft);
     const ref = before ? over : over.nextSibling;
-    if (d.ph.nextSibling !== ref) {   // 位置没变则跳过，避免 FLIP 动画被重启
+    if (ref !== d.ph && d.ph.nextSibling !== ref) {
       flip(d.grid, () => d.grid.insertBefore(d.ph, ref));
     }
-  } else if (over && d.grid.contains(over)) {
+  } else if (over.classList.contains('add-card')) {
     /* 添加卡上 → 网格末尾。添加卡被 prepend 到网格首位，
        insertBefore(d.ph, over) 会把卡片插到首位，与“末尾”意图相反。 */
     if (d.ph !== d.grid.lastChild) {
