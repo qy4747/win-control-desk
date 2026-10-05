@@ -1,4 +1,8 @@
 """Offline check: python -m unittest discover -s tests -p test_service_web.py."""
+import ctypes as C
+from ctypes import wintypes as W
+import gc
+import sys
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -8,6 +12,30 @@ import ops_entries
 
 
 class ServiceWebTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == 'win32', 'Windows property store required')
+    def test_repeated_window_property_reads_do_not_grow_type_caches(self):
+        user = C.WinDLL('user32', use_last_error=True)
+        user.CreateWindowExW.argtypes = [W.DWORD, W.LPCWSTR, W.LPCWSTR, W.DWORD,
+                                        C.c_int, C.c_int, C.c_int, C.c_int,
+                                        W.HWND, W.HMENU, W.HINSTANCE, C.c_void_p]
+        user.CreateWindowExW.restype = W.HWND
+        user.DestroyWindow.argtypes = [W.HWND]
+        # Own a hidden window so this test needs neither a browser nor user data.
+        hwnd = user.CreateWindowExW(0, 'STATIC', '', 0, 0, 0, 0, 0,
+                                    None, None, None, None)
+        self.assertTrue(hwnd, C.get_last_error())
+        try:
+            self.assertEqual(service_web.window_app_property(hwnd, 5), '')
+            def cache_sizes():
+                return len(C._pointer_type_cache), len(C._win_functype_cache)
+            before = cache_sizes()
+            for _ in range(256):
+                self.assertEqual(service_web.window_app_property(hwnd, 5), '')
+            gc.collect()
+            self.assertEqual(cache_sizes(), before)
+        finally:
+            user.DestroyWindow(hwnd)
+
     def test_installed_web_app_survives_browser_suffix_and_title_changes(self):
         exe = 'chrome.exe'
         rule = dict(exe=exe, windowClass='Chrome_WidgetWin_1', toolWindow=False,

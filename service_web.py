@@ -13,6 +13,23 @@ from ops_entries import bind_window, list_windows, operate_window, resolve_windo
 _launch_lock = threading.Lock()
 
 
+# ctypes caches pointer/function types globally. Reuse these definitions across
+# reads; defining them inside window_app_property leaks types on every poll.
+_GUID = C.c_ubyte * 16
+
+
+class _PropertyKey(C.Structure):
+    _fields_ = [('fmtid', _GUID), ('pid', W.DWORD)]
+
+
+class _PropertyValue(C.Union):
+    _fields_ = [('text', C.c_wchar_p), ('storage', C.c_ulonglong * 2)]
+
+
+class _PropVariant(C.Structure):
+    _fields_ = [('vt', W.WORD), ('reserved', W.WORD * 3), ('value', _PropertyValue)]
+
+
 def is_browser_window(row):
     return os.path.basename(row.get('exe') or '').lower() in ('chrome.exe', 'msedge.exe')
 
@@ -30,24 +47,17 @@ def new_app_window(rows, before, chrome):
 
 def window_app_property(hwnd, property_id):
     # Read only: https://learn.microsoft.com/windows/win32/api/shellapi/nf-shellapi-shgetpropertystoreforwindow
-    guid = C.c_ubyte * 16
-    class Key(C.Structure):
-        _fields_ = [('fmtid', guid), ('pid', W.DWORD)]
-    class Value(C.Union):
-        _fields_ = [('text', C.c_wchar_p), ('storage', C.c_ulonglong * 2)]
-    class Variant(C.Structure):
-        _fields_ = [('vt', W.WORD), ('reserved', W.WORD * 3), ('value', Value)]
-    iid = guid.from_buffer_copy(uuid.UUID('886d8eeb-8cf2-4446-8d02-cdba1dbdcf99').bytes_le)
-    key = Key(guid.from_buffer_copy(uuid.UUID('9f4c2855-9f79-4b39-a8d0-e1d42de1d5f3').bytes_le), property_id)
+    iid = _GUID.from_buffer_copy(uuid.UUID('886d8eeb-8cf2-4446-8d02-cdba1dbdcf99').bytes_le)
+    key = _PropertyKey(_GUID.from_buffer_copy(uuid.UUID('9f4c2855-9f79-4b39-a8d0-e1d42de1d5f3').bytes_le), property_id)
     ole, shell = C.WinDLL('ole32'), C.WinDLL('shell32')
-    shell.SHGetPropertyStoreForWindow.argtypes = [W.HWND, C.POINTER(guid), C.POINTER(C.c_void_p)]
+    shell.SHGetPropertyStoreForWindow.argtypes = [W.HWND, C.POINTER(_GUID), C.POINTER(C.c_void_p)]
     initialized = ole.CoInitialize(None) >= 0
-    store, value = C.c_void_p(), Variant()
+    store, value = C.c_void_p(), _PropVariant()
     try:
         if shell.SHGetPropertyStoreForWindow(hwnd, C.byref(iid), C.byref(store)) < 0:
             return ''
         methods = C.cast(store, C.POINTER(C.POINTER(C.c_void_p))).contents
-        get_value = C.WINFUNCTYPE(C.c_long, C.c_void_p, C.POINTER(Key), C.POINTER(Variant))(methods[5])
+        get_value = C.WINFUNCTYPE(C.c_long, C.c_void_p, C.POINTER(_PropertyKey), C.POINTER(_PropVariant))(methods[5])
         if get_value(store, C.byref(key), C.byref(value)) >= 0 and value.vt == 31:
             return value.value.text or ''
         return ''

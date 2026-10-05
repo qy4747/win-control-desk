@@ -152,6 +152,24 @@ while u.GetMessageW(C.byref(m),None,0,0)>0:
                 windows.append(dict(window, pid=21))
                 self.assertEqual(entries.instance_candidates(api, rule), [20, 21])
 
+    def test_bambu_document_argument_is_not_application_identity(self):
+        exe = 'C:/Bambu/bambu-studio.exe'
+        row = dict(exe=exe, args='"' + exe + '" "C:/Models/model.stl"', identity='now', ppid=0)
+        window = dict(exe=exe, windowClass='wxWindowNR', toolWindow=False, scope='application', pid=20)
+        app = dict(kind='desktop', instanceMatch=dict(exe=exe, argsHash='old', argsHashVersion=2),
+                   windowBinding={'match': window})
+        api = types.SimpleNamespace(SELF_PID=1, SELF_UID='mine', _win_process_table=lambda: {20: row},
+                                    process_uid=lambda _: 'mine')
+        self.assertTrue(entries.desktop_rule_upgrade_needed(app))
+        rule = entries.capture_instance_match(api, app, 20)
+        self.assertNotIn('argsHash', rule)
+        self.assertFalse(entries.desktop_rule_upgrade_needed(dict(app, instanceMatch=rule)))
+        with mock.patch.object(entries, 'list_windows', return_value=[window]):
+            row['args'] = '"' + exe + '" "C:/Models/different.3mf"'
+            self.assertEqual(entries.instance_candidates(api, rule), [20])
+        with mock.patch.object(entries, 'list_windows', return_value=[dict(window, windowClass='#32770')]):
+            self.assertEqual(entries.instance_candidates(api, rule), [])
+
     def test_argument_spacing_keeps_identity_and_legacy_hashes_work(self):
         exe = 'C:/AutoHotkey/AutoHotkey64.exe'
         original = f'"{exe}"  "H:/scripts/media router.ahk"'

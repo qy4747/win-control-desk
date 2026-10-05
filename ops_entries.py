@@ -26,6 +26,11 @@ DESKTOP_LAUNCH_FLAGS = {
 def desktop_rule_upgrade_needed(app):
     rule = app.get('instanceMatch') or {}
     exe = os.path.basename(rule.get('exe') or '').lower()
+    window = (app.get('windowBinding') or {}).get('match') or {}
+    if (app.get('kind') == 'desktop' and exe == 'bambu-studio.exe' and rule.get('argsHash')
+            and window.get('scope') == 'application' and window.get('windowClass') == 'wxWindowNR'
+            and same_window_executable(window.get('exe'), rule.get('exe'))):
+        return True
     version = 4 if exe == 'quark_cloud_drive.exe' else 3
     return (app.get('kind') == 'desktop' and exe in DESKTOP_LAUNCH_FLAGS
             and bool(rule.get('argsHash')) and rule.get('argsHashVersion', 1) < version)
@@ -210,7 +215,9 @@ def capture_instance_match(api, app, pid):
         version = 4 if executable == 'quark_cloud_drive.exe' else 3
         rule.update(argsHash=instance_args_hash(row['exe'], row['args'], parse, launch_modes=version), argsHashVersion=version)
     if (app.get('kind') == 'desktop' and
-            (executable in {'pixpin.exe', 'cloudmusic.exe'} or (executable == 'chatgpt.exe' and 'openai.codex_' in row['exe'].lower())) and
+            (executable in {'pixpin.exe', 'cloudmusic.exe'}
+             or (executable == 'bambu-studio.exe' and window_match.get('windowClass') == 'wxWindowNR')
+             or (executable == 'chatgpt.exe' and 'openai.codex_' in row['exe'].lower())) and
             window_match.get('scope') == 'application' and window_match.get('windowClass') and
             same_window_executable(window_match.get('exe'), row['exe'])):
         return dict(exe=row['exe'], windowClass=window_match['windowClass'],

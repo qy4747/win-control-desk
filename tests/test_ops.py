@@ -432,7 +432,7 @@ s.serve_forever(); s.server_close()
                     build.assert_not_called()
                 self.assertTrue(request('/api/ops/action', dict(appId=app['id'], actionId='echo'))[1]['ok'])
                 self.assertEqual(h.request('POST','/api/ops/force',json.dumps({'appId':app['id'],'confirmed':True}),
-                    dict(headers, Origin='https://attacker.example', **{'Sec-Fetch-Site':'cross-site'}))[0],403)
+                    dict(headers, Cookie='console_session=expired', Origin='https://example.invalid', **{'Sec-Fetch-Site':'cross-site'}))[0],403)
                 self.assertEqual(request('/api/ops/force', {'appId':app['id']})[0],400)
                 self.assertTrue(request('/api/apps/'+app['id']+'/restart', {})[1]['ok'])
                 self.assertIsNotNone(children[0].poll())

@@ -1176,19 +1176,24 @@ class ConsoleRestartTests(unittest.TestCase):
                     "etime": 30},
             71004: {"uid": server.SELF_UID, "args": "python3 server.py --launcher",
                     "etime": 40},
+            71005: {"uid": server.SELF_UID, "args": "python3 server.py --restart-helper 70000 9602", "etime": 50},
+            71006: {"uid": server.SELF_UID, "args": "python3 server.py --restart-helper 71005 9602", "etime": 1},
         }
         with mock.patch.object(server, "ps_snapshot", return_value=snap), \
                 mock.patch.object(server, "lsof_cwds", return_value={
                     71001: server.BASE_DIR,
                     71002: "/tmp/different-project",
                     71004: server.BASE_DIR,
+                    71005: server.BASE_DIR,
+                    71006: server.BASE_DIR,
                 }), \
                 mock.patch.object(server, "scan_listeners", return_value={
-                    (71001, 9600), (71004, 9601)}):
+                    (71001, 9600), (71004, 9601), (71005, 9602)}):
             found = server.find_console_instances()
-        self.assertEqual([item["pid"] for item in found], [71001, 71004])
+        self.assertEqual([item["pid"] for item in found], [71001, 71004, 71005])
         self.assertEqual(found[0]["ports"], [9600])
         self.assertEqual(found[1]["ports"], [9601])
+        self.assertEqual(found[2]["ports"], [9602])
 
     def test_panel_restart_spawns_helper_before_shutdown(self):
         class FakeServer:

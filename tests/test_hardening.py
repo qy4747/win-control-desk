@@ -81,6 +81,7 @@ class HttpSecurityTests(unittest.TestCase):
         value = headers.get("Set-Cookie", "")
         self.assertIn("HttpOnly", value)
         self.assertIn("SameSite=Strict", value)
+        self.assertIn("worker-src 'self' blob:", headers.get("Content-Security-Policy", ""))
         return value.split(";", 1)[0]
 
     def test_dns_rebinding_host_is_rejected_without_setting_cookie(self):
@@ -91,15 +92,18 @@ class HttpSecurityTests(unittest.TestCase):
         self.assertFalse(body["ok"])
         self.assertNotIn("Set-Cookie", headers)
 
-    def test_cross_origin_browser_write_is_rejected_even_with_cookie(self):
+    def test_origin_values_do_not_block_valid_local_control_session(self):
         cookie = self._session_cookie()
-        headers = self._browser_headers(cookie, "https://attacker.example")
-        headers["Sec-Fetch-Site"] = "cross-site"
-        status, body, _ = self.h.request(
-            "POST", "/api/ui/theme", json.dumps({"theme": "ops"}), headers)
-        self.assertEqual(status, 403)
-        self.assertFalse(body["ok"])
-        self.assertEqual(self.h.cfg.snapshot()["uiTheme"], "ops")
+        for origin in ("null", "http://localhost:%d" % self.h.port, "https://example.invalid"):
+            with self.subTest(origin=origin):
+                headers = self._browser_headers(cookie, origin)
+                headers["Sec-Fetch-Site"] = "cross-site"
+                status, body, _ = self.h.request(
+                    "POST", "/api/ui/theme", json.dumps({"theme": "ops"}), headers)
+                self.assertEqual(status, 200)
+                self.assertTrue(body["ok"])
+                headers["Cookie"] = "console_session=expired"
+                self.assertEqual(self.h.request("POST", "/api/ui/theme", json.dumps({"theme": "ops"}), headers)[0], 403)
 
     def test_same_origin_browser_write_requires_valid_http_only_session(self):
         status, _, _ = self.h.request(

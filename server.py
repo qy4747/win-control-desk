@@ -4221,18 +4221,6 @@ class Handler(BaseHTTPRequestHandler):
         except (AttributeError, IndexError):
             return False
 
-    def _same_origin(self, origin, host):
-        try:
-            parsed = urllib.parse.urlsplit(origin)
-            port = parsed.port or (80 if parsed.scheme == "http" else 443)
-            return (parsed.scheme == "http"
-                    and (parsed.hostname or "").lower() == host[0]
-                    and port == host[1]
-                    and not parsed.username and not parsed.password
-                    and not parsed.path and not parsed.query and not parsed.fragment)
-        except (ValueError, UnicodeError):
-            return False
-
     def _has_control_cookie(self):
         try:
             cookie = SimpleCookie()
@@ -4290,8 +4278,8 @@ class Handler(BaseHTTPRequestHandler):
     def authorize_request(self, mutating=False, content_kind=None):
         """Enforce the loopback browser trust boundary.
 
-        Browser writes require exact same-origin metadata plus the HttpOnly
-        session cookie issued by this process. Headerless local CLI clients stay
+        Browser writes require the HttpOnly session cookie issued by this
+        process; Origin/Fetch-Site values are not compared. Local CLI clients stay
         compatible, but JSON/image Content-Type rules keep those paths
         unavailable to simple cross-site HTML forms.
         """
@@ -4303,10 +4291,6 @@ class Handler(BaseHTTPRequestHandler):
 
         site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
         origin = (self.headers.get("Origin") or "").strip()
-        if site and site not in ("same-origin", "none"):
-            return self._deny_request(403, "拒绝跨站控制请求")
-        if origin and not self._same_origin(origin, host):
-            return self._deny_request(403, "请求 Origin 不是当前控制台")
         if (site or origin) and not self._has_control_cookie():
             return self._deny_request(403, "控制会话已失效，请刷新页面")
 
@@ -4349,7 +4333,7 @@ class Handler(BaseHTTPRequestHandler):
             "Content-Security-Policy",
             "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; "
             "form-action 'self'; connect-src 'self'; img-src 'self' data: blob:; "
-            "font-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'")
+            "font-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; worker-src 'self' blob:")
         if set_cookie and self._request_host_allowed():
             self.send_header(
                 "Set-Cookie",
@@ -5411,8 +5395,7 @@ def find_console_instances():
     for pid, info in snap.items():
         args = info.get("args") or ""
         if (pid == SELF_PID or info.get("uid") != SELF_UID
-                or "server.py" not in args
-                or "--restart-helper" in args):
+                or "server.py" not in args):
             continue
         candidates.append(pid)
     cwds = lsof_cwds(candidates)
@@ -5429,6 +5412,10 @@ def find_console_instances():
         if not same_dir:
             continue
         info = snap.get(pid, {})
+        # The restart helper becomes the long-running server in the same PID.
+        # Ignore only helpers still waiting for the old instance to exit.
+        if "--restart-helper" in (info.get("args") or "") and not listener_map.get(pid):
+            continue
         result.append({
             "pid": pid,
             "ports": sorted(listener_map.get(pid, [])),
