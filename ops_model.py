@@ -7,17 +7,29 @@ import sys
 import urllib.parse
 import urllib.request
 
+MEMORY_RULES = [
+    dict(id='system-commit', name='整机提交内存接近上限', metric='commitPercent', threshold=85,
+         recoveryThreshold=80, durationSec=60, intervalSec=10, muted=False),
+    dict(id='process-private', name='进程提交内存较高', metric='processPrivateBytes', threshold=4*1024**3,
+         recoveryThreshold=3*1024**3, durationSec=120, intervalSec=10, muted=False),
+    dict(id='process-growth', name='进程提交内存增长较多', metric='processPrivateGrowthBytes', threshold=1024**3,
+         recoveryThreshold=512*1024**2, windowSec=1800, durationSec=60, intervalSec=10, muted=False),
+    dict(id='console-private', name='总控台提交内存较高', metric='processPrivateBytes', processScope='console',
+         threshold=256*1024**2, recoveryThreshold=192*1024**2, durationSec=120, intervalSec=10, muted=False),
+]
+PROCESS_MEMORY_METRICS = {'processPrivateBytes', 'processPrivateGrowthBytes'}
+
 DEFAULT_RULES = [
     dict(id='system-cpu', name='整机 CPU', metric='cpu', threshold=90, durationSec=60, intervalSec=10, muted=False),
     dict(id='system-memory', name='整机内存', metric='memoryPercent', threshold=90, durationSec=60, intervalSec=10, muted=False),
     dict(id='disk-free', name='磁盘剩余空间', metric='diskFreePercent', threshold=10, durationSec=60, intervalSec=60, muted=False),
-]
+] + MEMORY_RULES
 APP_FIELDS = dict(category='', actions=[], probe=None, alertPolicy={},
                   externalIdentity=None, expectedRunning=False, startedAt=None,
                   stopAction=None, cardButtons=None, windowBinding=None, instanceMatch=None)
 METRICS = {'cpu', 'memoryPercent', 'memoryBytes', 'diskFreePercent',
            'diskWriteBytesPerSec', 'diskWriteBytes', 'directoryBytes',
-           'directoryGrowthBytes', 'directorySnapshotGrowthBytes', 'gpuPercent'}
+           'directoryGrowthBytes', 'directorySnapshotGrowthBytes', 'gpuPercent', 'commitPercent'} | PROCESS_MEMORY_METRICS
 
 
 def number(value, label, low=0, high=1e18):
@@ -205,6 +217,13 @@ def validate_rules(items):
                  muted=item.get('muted', False), path=item.get('path', ''))
         if r['metric'] not in METRICS or not re.fullmatch(r'[\w-]+', r['id']) or r['id'] in ids or type(r['muted']) is not bool:
             raise ValueError('规则指标、ID 或静音设置无效')
+        if r['metric'] in PROCESS_MEMORY_METRICS:
+            r['processScope'] = item.get('processScope', 'all')
+            if r['processScope'] not in ('all', 'console'):
+                raise ValueError('进程范围无效')
+            r['intervalSec'] = max(10, r['intervalSec'])
+        if r['metric'] == 'commitPercent' and max(r['threshold'], r['recoveryThreshold']) > 100:
+            raise ValueError('提交内存百分比不能超过 100')
         if (r['metric'] == 'diskFreePercent' and r['recoveryThreshold'] < r['threshold']) or (r['metric'] != 'diskFreePercent' and r['recoveryThreshold'] > r['threshold']):
             raise ValueError('恢复阈值应位于正常一侧')
         if r['metric'].startswith('directory'):

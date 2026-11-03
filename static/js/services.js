@@ -37,7 +37,7 @@ let discoveryNeedsBaseline = true;
 setChildren(portDiscoveryIcon, icon('activity', 17));
 
 function serviceSnapshotHealthy(data) {
-  return !(data.degradedReasons || [])
+  return data.sampledAt !== null && !(data.degradedReasons || [])
     .some(item => item && item.component === 'services');
 }
 

@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 
 STATIC = Path(__file__).resolve().parents[1] / 'static'
 sys.path.insert(0, str(STATIC.parent))
-from ops_model import validate_app_extra
+from ops_model import MEMORY_RULES, validate_app_extra
 from ops_monitor import Alerts
 GIB = 1024 ** 3
 
@@ -73,6 +73,7 @@ class Demo:
             app['pids'] = [app['lastPid']] if app['running'] else []
         rules = [dict(id='system-cpu', name='整机 CPU', metric='cpu', threshold=90, durationSec=60, intervalSec=10, muted=False),
                  dict(id='disk-free', name='磁盘剩余空间', metric='diskFreePercent', threshold=10, durationSec=60, intervalSec=60, muted=False)]
+        rules += copy.deepcopy(MEMORY_RULES)
         themes = []
         theme_root = STATIC / 'themes'
         manifests = [(p, None) for p in sorted(theme_root.glob('*.json'))]
@@ -90,9 +91,11 @@ class Demo:
             themes.append(meta)
         self.data = dict(apps=apps, services=[], watched=[], watchedKeywords=['ffmpeg'], consolePort=self.port,
             consolePid=99999, consoleCwd='演示：不读取真实工作目录', dataDir='仅内存，不写入正式配置', logsDir='演示日志',
-            platform='win32', version='demo', schemaVersion=8, uiTheme='ops', themes=themes, degraded=False,
+            platform='win32', version='demo', schemaVersion=9, uiTheme='ops', themes=themes, degraded=False,
             degradedReasons=[], configHealth=dict(writable=True, issues=[]), stale=False, notificationStatus='disabled',
             system=dict(cpu=24.6, memoryPercent=58.2, diskWriteBytesPerSec=12*1024**2,
+                        commitBytes=20*GIB, commitLimitBytes=64*GIB, commitPercent=31.25,
+                        memoryAvailableBytes=13.4*GIB, processMemoryCoverage=dict(total=240, readable=238),
                         gpus=[dict(id='演示 GPU', dedicatedBytes=6*GIB, sharedBytes=512*1024**2)],
                         disks=[dict(path='C:\\', freeBytes=8*GIB, totalBytes=256*GIB), dict(path='D:\\', freeBytes=600*GIB, totalBytes=1024*GIB)]),
             directories={'C:\\Demo\\outputs': dict(status='ok', bytes=24*GIB)}, rules=rules,

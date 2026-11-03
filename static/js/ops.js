@@ -47,17 +47,19 @@ function openAlertBubble(target, anchor, key = null) {
 function alertValue(a, value) {
   if (typeof value !== 'number') return String(value ?? '未知');
   if (a.metric?.includes('Bytes') || a.key?.endsWith(':memory')) return bytes(value) + (a.metric?.endsWith('PerSec') ? '/s' : '');
-  return ['cpu', 'memoryPercent', 'gpuPercent', 'diskFreePercent'].includes(a.metric) ? value.toFixed(1) + '%' : String(value);
+  return ['cpu', 'memoryPercent', 'commitPercent', 'gpuPercent', 'diskFreePercent'].includes(a.metric) ? value.toFixed(1) + '%' : String(value);
 }
 function alertControls(parent, a) {
   const title = el('strong'); title.textContent = a.title; parent.append(title);
-  note(parent, a.unknown ? '等待可靠的采集结果' : '当前 ' + alertValue(a, a.value) + (a.threshold != null ? ' · 原阈值 ' + alertValue(a, a.threshold) : ''));
+  const readings = a.process ? section(parent, '判断依据与读数') : parent;
+  note(readings, a.unknown ? '等待可靠的采集结果' : '当前 ' + alertValue(a, a.value) + (a.threshold != null ? ' · 原阈值 ' + alertValue(a, a.threshold) : ''));
+  if (a.detail) note(readings, a.detail);
   if (!a.incident) return;
   let threshold = null, scale = a.metric?.includes('Bytes') || a.key?.endsWith(':memory') ? 1048576 : 1;
   if (a.threshold != null) {
     const below = a.comparison === 'below';
     let proposed = below ? Math.min(a.value, a.threshold) * .9 : Math.max(a.value, a.threshold) * 1.1;
-    if (['cpu', 'memoryPercent', 'gpuPercent', 'diskFreePercent'].includes(a.metric)) proposed = Math.min(100, proposed);
+    if (['cpu', 'memoryPercent', 'commitPercent', 'gpuPercent', 'diskFreePercent'].includes(a.metric)) proposed = Math.min(100, proposed);
     threshold = field(parent, '临时阈值（' + (scale > 1 ? 'MiB' + (a.metric?.endsWith('PerSec') ? '/秒' : '') : '%') + '）', Number((proposed / scale).toPrecision(4)), 'number');
     threshold.disabled = !!a.unknown;
     note(parent, '超过临时阈值仍提醒；满足原基线恢复条件后自动结束。');
@@ -343,9 +345,9 @@ function openAlerts(target) {
 }
 function renderAlerts() {
   if (!alertTarget) return;
-  // 轮询更新读数时复用折叠分组；标题及目录完整路径在此面板内唯一。
+  // 轮询复用折叠分组；进程依据按告警 key 区分相同标题。
   const sections = new Map([...content.querySelectorAll('.ops-section')]
-    .map(node => [node.firstElementChild.textContent, node]));
+    .map(node => [node.dataset?.sectionKey || node.firstElementChild.textContent, node]));
   const focused = content.contains(document.activeElement) ? document.activeElement : null;
   const scroll = content.scrollTop;
   const data = state.data || {};
@@ -353,13 +355,15 @@ function renderAlerts() {
   const alerts = alertTarget === 'system' ? (data.alerts || []).filter(a => a.target === 'system' && !a.ignored) : appAlerts(app);
   content.replaceChildren();
   if (data.stale || data.degraded || app?.statusKnown === false) note(content, '采集数据不完整，以下状态可能尚未更新。');
-  if (!alerts.length) note(content, '当前没有异常');
+  if (!alerts.length) note(content, '已监测项目暂无未处理告警');
   for (const a of alerts) {
     const item = el('article', 'ops-alert-item');
     const title = el('strong'); title.textContent = a.title; item.append(title);
-    const rule = data.rules?.find(r => a.key?.startsWith('rule:' + r.id + ':'));
-    const value = typeof a.value === 'number' ? (rule?.metric?.includes('Bytes') || a.key?.endsWith(':memory') ? bytes(a.value) + (rule?.metric?.endsWith('PerSec') ? '/s' : '') : a.value.toFixed(1) + '%') : a.value;
-    note(item, (a.unknown ? '等待新的采集结果' : '当前：' + (value ?? '未知')) + (a.muted ? ' · 已静音' : ''));
+    const value = alertValue(a, a.value);
+    const readings = a.process ? section(item, '判断依据与读数') : item;
+    if (a.process) readings.dataset.sectionKey = a.key;
+    note(readings, (a.unknown ? '等待新的采集结果' : '当前：' + (value ?? '未知')) + (a.muted ? ' · 已静音' : ''));
+    if (a.detail) note(readings, a.detail);
     if (a.incident) { const edit = button('处理异常', () => openAlertBubble(alertTarget, edit, a.key)); item.append(edit); }
     const event = data.events?.find(e => e.key === a.key && e.phase === 'alert');
     if (event) note(item, '发生于 ' + new Date(event.at * 1000).toLocaleString());
@@ -368,7 +372,10 @@ function renderAlerts() {
   if (alertTarget === 'system') {
     const s = data.system || {};
     const readings = section(content, '资源读数');
-    note(readings, 'CPU ' + pct(s.cpu) + ' · 内存 ' + pct(s.memoryPercent) + '\n磁盘写入 ' + bytes(s.diskWriteBytesPerSec) + '/s');
+    note(readings, 'CPU ' + pct(s.cpu) + ' · 物理内存 ' + pct(s.memoryPercent) + '\n磁盘写入 ' + bytes(s.diskWriteBytesPerSec) + '/s');
+    note(readings, '整机提交 ' + bytes(s.commitBytes) + ' / ' + bytes(s.commitLimitBytes) + '（' + pct(s.commitPercent) + '）\n可用物理内存 ' + bytes(s.memoryAvailableBytes));
+    note(readings, memoryHealth(data).detail);
+    note(readings, '提醒综合占用、持续增长和系统压力，不等于已确认泄漏。进程规则包括总控台自身，不要求添加卡片；共享服务宿主按整个进程统计。');
     for (const d of s.disks || []) note(readings, d.path + ' 剩余 ' + bytes(d.freeBytes) + ' / ' + bytes(d.totalBytes));
     renderDirectorySnapshots(content, data);
     content.append(button('配置目录定时快照', () => openRules()));
@@ -377,13 +384,24 @@ function renderAlerts() {
   const events = section(content, '最近事件');
   note(events, (data.events || []).filter(e => e.target === alertTarget).slice(0, 30).map(e => new Date(e.at * 1000).toLocaleString() + ' · ' + e.title + ' · ' + e.detail).join('\n') || '暂无事件');
   for (const updated of content.querySelectorAll('.ops-section')) {
-    const previous = sections.get(updated.firstElementChild.textContent);
+    const previous = sections.get(updated.dataset?.sectionKey || updated.firstElementChild.textContent);
     if (!previous) continue;
     previous.replaceChildren(previous.firstElementChild, ...[...updated.children].slice(1));
     updated.replaceWith(previous);
   }
   if (focused?.isConnected) focused.focus({ preventScroll: true });
   content.scrollTop = scroll;
+}
+
+function memoryHealth(data) {
+  const coverage = data.system?.processMemoryCoverage;
+  const enabled = (data.rules || []).some(r => r.metric === 'processPrivateBytes' && r.processScope !== 'console');
+  const ready = coverage && coverage.total > 0 && coverage.readable > 0 && Number.isFinite(data.system?.commitPercent);
+  const detail = coverage ? '进程内存已读取 ' + coverage.readable + ' / ' + coverage.total + '；不可读取 ' + (coverage.total - coverage.readable) + '。' : '进程内存覆盖范围尚不可用。';
+  if (data.stale || data.degraded || data.sampledAt === null) return { label: '系统状态待更新', partial: true, detail: '正在等待完整的新采样。' + detail };
+  if (!enabled) return { label: '进程内存规则未启用', partial: true, detail: detail + '请在系统基线中启用进程提交内存规则。' };
+  if (!ready || coverage.readable < coverage.total) return { label: '未见异常 · 部分不可读', partial: true, detail };
+  return { label: '未见已监测项异常', partial: false, detail };
 }
 
 async function executeAction(appId, action) {
@@ -641,6 +659,7 @@ async function loadConfig() {
   if (!response.ok) throw new Error(data.error || '读取配置失败'); config = data;
 }
 const metricOptions = [['cpu', '整机 CPU（%）'], ['memoryPercent', '整机内存（%）'], ['memoryBytes', '整机内存（字节）'],
+  ['commitPercent', '整机提交内存（%）'], ['processPrivateBytes', '每个进程提交内存（字节）'], ['processPrivateGrowthBytes', '每个进程提交内存净增长（字节）'],
   ['diskFreePercent', '磁盘剩余空间（%）'], ['diskWriteBytesPerSec', '磁盘写入（字节/秒）'], ['diskWriteBytes', '区间写入（字节）'],
   ['directoryBytes', '指定目录大小（字节）'], ['directoryGrowthBytes', '目录增长（字节）'], ['gpuPercent', '显存（%，需可读容量）']];
 function renderDirectorySnapshots(parent, data) {
@@ -667,6 +686,8 @@ function renderDirectorySnapshots(parent, data) {
 async function openRules() {
   await loadConfig(); if (!show('系统基线与事件')) return;
   note(content, '基线只检查与提醒，不修改系统。目录检查仅在你明确指定后启用；显存容量不可用时不触发百分比规则。');
+  note(content, '进程内存规则覆盖可读取的系统进程和总控台。判断间隔不短于 10 秒；增长窗口每个进程最多保留 32 个采样点，进程退出后清除。高占用提醒可按实际工作负载调整或临时接受。');
+  note(content, '所有进程的占用规则还要求整机提交达到 85%、物理内存达到 90%，或提交达到驻留的 4 倍；增长规则要求窗口内三个时段均增长、总增长达到起点的 25%。仅总控台的占用规则按其内存预算判断。');
   const list = el('div'); content.append(list); const editors = [];
   function addSnapshot(rule = {}) {
     const box = section(list, rule.name || '目录定时快照', true);
@@ -697,6 +718,7 @@ async function openRules() {
     const box = section(list, rule.name || '新规则', true);
     const name = field(box, '名称', rule.name || '新规则');
     const metric = select(box, '指标', metricOptions, rule.metric || 'cpu');
+    const scope = select(box, '进程范围（进程指标使用）', [['all', '所有可读取进程'], ['console', '仅总控台自身']], rule.processScope || 'all');
     const gpu = [...metric.options].find(o => o.value === 'gpuPercent');
     gpu.disabled = !(state.data?.system?.gpus || []).some(g => g.capacityBytes && g.dedicatedBytes != null);
     const threshold = field(box, '触发阈值（磁盘剩余空间为低于，其余为高于）', rule.threshold ?? 90, 'number');
@@ -707,7 +729,7 @@ async function openRules() {
     const window = field(box, '增量比较窗口（秒）', rule.windowSec || 900, 'number');
     const mute = field(box, '静音此规则', rule.muted, 'checkbox');
     const entry = { removed: false, read: () => ({ id: rule.id || name.dataset.id, name: name.value,
-      metric: metric.value, threshold: Number(threshold.value), recoveryThreshold: Number(recovery.value),
+      metric: metric.value, processScope: scope.value, threshold: Number(threshold.value), recoveryThreshold: Number(recovery.value),
       durationSec: Number(duration.value), intervalSec: Number(interval.value), path: path.value,
       windowSec: Number(window.value), muted: mute.checked }) };
     name.dataset.id = crypto.randomUUID();
@@ -1118,9 +1140,11 @@ function filterCards() {
 export function renderOps(data) {
   if (bubbleAlert && !(data.alerts || []).some(a => a.key === bubbleAlert.key && a.incident === bubbleAlert.incident && !a.ignored)) closeBubble();
   const count = (data.alerts || []).filter(a => a.target === 'system' && !a.ignored).length;
-  setText(systemSummary, count ? '系统 · ' + count + ' 项异常' : data.stale || data.degraded ? '系统状态待更新' : '系统正常');
+  const memory = memoryHealth(data);
+  setText(systemSummary, count ? '系统 · ' + count + ' 项异常' : memory.label);
+  systemSummary.title = memory.detail;
   systemSummary.classList.toggle('has-alert', count > 0);
-  systemSummary.classList.toggle('is-pending', !count && !!(data.stale || data.degraded));
+  systemSummary.classList.toggle('is-pending', !count && memory.partial);
   systemSummary.setAttribute('aria-label', count ? count + ' 项系统异常，查看原因' : '查看系统状态');
   setText(notificationState, '后台 Windows 通知：' + ({ ready: '可用', disabled: '已关闭', unavailable: '不可用', starting: '准备中', pending: '待首次通知验证', busy: '忙碌' }[data.notificationStatus] || '未知'));
   const s = data.system || {};
@@ -1163,7 +1187,7 @@ export function renderOps(data) {
   setText(sceneSwitch, selectedPreset && selectedPreset === data.activePreset ? '重新应用场景' : '切换场景');
   sceneSwitch.title = selectedPreset ? '确认保存工作后再执行所选场景' : '先选择一个场景';
   renderSceneRun(data.presetRun);
-  const next = JSON.stringify([alertTarget, data.alerts, data.events, data.stale, data.degraded, data.directorySnapshots, data.rules, data.apps?.map(a => [a.id, a.health, a.alerts])]);
+  const next = JSON.stringify([alertTarget, data.alerts, data.events, data.stale, data.degraded, data.system, data.directorySnapshots, data.rules, data.apps?.map(a => [a.id, a.health, a.alerts])]);
   if (alertSignature !== next) { alertSignature = next; renderAlerts(); }
   const categories = [...new Set((data.apps || []).map(a => a.category).filter(Boolean))].sort();
   const sig = categories.join('|');

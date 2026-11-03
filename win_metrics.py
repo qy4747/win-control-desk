@@ -7,6 +7,9 @@ import shutil
 import socket
 import time
 
+# CPU deltas over shorter spans are dominated by scheduling noise.
+CPU_MIN_INTERVAL_SEC = 1.0
+
 
 class Memory(C.Structure):
     _fields_ = [('length', W.DWORD), ('load', W.DWORD)] + [
@@ -17,7 +20,23 @@ class Memory(C.Structure):
 class ProcessMemory(C.Structure):
     _fields_ = [('cb', W.DWORD), ('faults', W.DWORD)] + [
         (n, C.c_size_t) for n in ('peak', 'working', 'peakPaged', 'paged',
-                                'peakNonpaged', 'nonpaged', 'page', 'peakPage')]
+                                'peakNonpaged', 'nonpaged', 'page', 'peakPage', 'private')]
+
+
+class Performance(C.Structure):
+    # PERFORMANCE_INFORMATION uses page counts; convert with its own PageSize.
+    _fields_ = [('cb', W.DWORD)] + [(n, C.c_size_t) for n in (
+        'commit', 'limit', 'peak', 'physical', 'available', 'cache', 'kernel',
+        'paged', 'nonpaged', 'pageSize')] + [(n, W.DWORD) for n in ('handles', 'processes', 'threads')]
+
+
+class ServiceStatus(C.Structure):
+    _fields_ = [(n, W.DWORD) for n in ('type', 'state', 'controls', 'exit',
+        'serviceExit', 'checkpoint', 'wait', 'pid', 'flags')]
+
+
+class ServiceEntry(C.Structure):
+    _fields_ = [('name', W.LPWSTR), ('display', W.LPWSTR), ('status', ServiceStatus)]
 
 
 class IO(C.Structure):
@@ -65,10 +84,20 @@ class Metrics:
         self.k.QueryFullProcessImageNameW.argtypes = [W.HANDLE, W.DWORD, W.LPWSTR, C.POINTER(W.DWORD)]
         self.k.GetProcessTimes.argtypes = [W.HANDLE] + [C.POINTER(C.c_ulonglong)] * 4
         self.k.K32GetProcessMemoryInfo.argtypes = [W.HANDLE, C.POINTER(ProcessMemory), W.DWORD]
+        self.k.K32GetPerformanceInfo.argtypes = [C.POINTER(Performance), W.DWORD]
         self.k.GetProcessIoCounters.argtypes = [W.HANDLE, C.POINTER(IO)]
         self.nt.NtQueryInformationProcess.argtypes = [W.HANDLE, W.ULONG, C.c_void_p, W.ULONG, C.POINTER(W.ULONG)]
+        self.scm = C.WinDLL('advapi32', use_last_error=True)
+        self.scm.OpenSCManagerW.argtypes = [W.LPCWSTR, W.LPCWSTR, W.DWORD]
+        self.scm.OpenSCManagerW.restype = W.HANDLE
+        self.scm.CloseServiceHandle.argtypes = [W.HANDLE]
+        self.scm.EnumServicesStatusExW.argtypes = [W.HANDLE, C.c_int, W.DWORD, W.DWORD,
+            C.c_void_p, W.DWORD, C.POINTER(W.DWORD), C.POINTER(W.DWORD), C.POINTER(W.DWORD), W.LPCWSTR]
+        self.service_cache, self.service_cache_at = {}, float('-inf')
         self.previous = {}
         self.previous_system = None
+        self.previous_system_at = float('-inf')
+        self.system_cpu = None
         self.table = {}
         self.seen_pids = set()
         self.system = {}
@@ -162,6 +191,31 @@ class Metrics:
             raise OSError('无法读取物理内存')
         return m
 
+    def service_names(self, pid, identity):
+        # Only queried for a memory warning; one local read per minute, no WMI.
+        now = time.monotonic()
+        if now-self.service_cache_at >= 60:
+            self.service_cache, self.service_cache_at = {}, now
+            handle = self.scm.OpenSCManagerW(None, None, 4)  # Enumerate only.
+            if handle:
+                try:
+                    buf = C.create_string_buffer(256*1024)
+                    needed, count, resume = W.DWORD(), W.DWORD(), W.DWORD()
+                    # ponytail: one 256 KiB page; on overflow keep the process name,
+                    # add pagination only for machines with larger service lists.
+                    if self.scm.EnumServicesStatusExW(handle, 0, 0x30, 1, buf, len(buf),
+                            C.byref(needed), C.byref(count), C.byref(resume), None):
+                        entries = C.cast(buf, C.POINTER(ServiceEntry))
+                        for i in range(count.value):
+                            entry = entries[i]
+                            row = self.table.get(entry.status.pid)
+                            if row and row.get('identity'):
+                                self.service_cache.setdefault((entry.status.pid, row['identity']), []).append(
+                                    dict(name=entry.name, display=entry.display))
+                finally:
+                    self.scm.CloseServiceHandle(handle)
+        return self.service_cache.get((pid, identity), [])
+
     def command(self, handle):
         size = W.ULONG()
         self.nt.NtQueryInformationProcess(handle, 60, None, 0, C.byref(size))
@@ -198,10 +252,17 @@ class Metrics:
                 identity = (pid, created.value)
                 old = self.previous.get(identity)
                 ticks = kernel.value + user.value
-                cpu = (max(0, ticks - old[1]) / 1e7 / max(.001, now - old[0]) * 100 / (os.cpu_count() or 1)
-                       if old else None)
-                previous[identity] = (now, ticks)
                 cached = self.table.get(pid, {})
+                if old and now - old[0] < CPU_MIN_INTERVAL_SEC:
+                    # On-demand resamples within one collector round would
+                    # otherwise divide by a few milliseconds and mostly
+                    # measure the console's own scan.
+                    cpu = cached.get('cpu') if cached.get('identity') == str(created.value) else None
+                    previous[identity] = old
+                else:
+                    cpu = (max(0, ticks - old[1]) / 1e7 / (now - old[0]) * 100 / (os.cpu_count() or 1)
+                           if old else None)
+                    previous[identity] = (now, ticks)
                 if cached.get('identity') == str(created.value):
                     exe, args = cached['exe'], cached['args']
                 else:
@@ -210,25 +271,33 @@ class Metrics:
                     args = self.command(handle)
                 mem, io = ProcessMemory(), IO()
                 mem.cb = C.sizeof(mem)
-                ws = mem.working if self.k.K32GetProcessMemoryInfo(handle, C.byref(mem), mem.cb) else None
+                memory_ok = self.k.K32GetProcessMemoryInfo(handle, C.byref(mem), mem.cb)
+                ws = mem.working if memory_ok else None
                 write_bytes = io.writeBytes if self.k.GetProcessIoCounters(handle, C.byref(io)) else None
                 table[pid] = dict(ppid=ppid, name=os.path.basename(exe), exe=exe, args=args,
                                   created=(created.value - 116444736000000000) / 1e7,
                                   identity=str(created.value), ws=ws, cpu=cpu, ioWriteBytes=write_bytes,
+                                  privateBytes=mem.private if memory_ok else None,
+                                  peakPrivateBytes=mem.peakPage if memory_ok else None,
                                   gpuMemoryBytes=self.gpu_memory(handle))
             finally:
                 self.k.CloseHandle(handle)
         self.previous, self.table = previous, table
         idle, kernel, user = [C.c_ulonglong() for _ in range(3)]
-        cpu = None
-        if self.k.GetSystemTimes(C.byref(idle), C.byref(kernel), C.byref(user)):
+        cpu = self.system_cpu
+        if (now - self.previous_system_at >= CPU_MIN_INTERVAL_SEC
+                and self.k.GetSystemTimes(C.byref(idle), C.byref(kernel), C.byref(user))):
             current = (idle.value, kernel.value + user.value)
+            cpu = None
             if self.previous_system:
                 di, dt = [a-b for a, b in zip(current, self.previous_system)]
                 if dt > 0:
                     cpu = max(0, min(100, (1-di/dt)*100))
-            self.previous_system = current
+            self.previous_system, self.previous_system_at, self.system_cpu = current, now, cpu
         mem = self.memory()
+        perf = Performance()
+        perf.cb = C.sizeof(perf)
+        perf_ok = self.k.K32GetPerformanceInfo(C.byref(perf), perf.cb)
         if now - self.disk_at >= 60:
             disks = []
             for letter in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
@@ -243,6 +312,13 @@ class Metrics:
             self.disks, self.disk_at = disks, now
         self.system = dict(cpu=cpu, memoryBytes=mem.total-mem.available,
                            memoryTotalBytes=mem.total, memoryPercent=mem.load,
+                           memoryAvailableBytes=mem.available,
+                           commitBytes=perf.commit*perf.pageSize if perf_ok else None,
+                           commitLimitBytes=perf.limit*perf.pageSize if perf_ok else None,
+                           commitPeakBytes=perf.peak*perf.pageSize if perf_ok else None,
+                           commitPercent=perf.commit/perf.limit*100 if perf_ok and perf.limit else None,
+                           processMemoryCoverage=dict(total=len(ppids), readable=sum(
+                               r['privateBytes'] is not None for r in table.values())),
                            disks=self.disks,
                            diskWriteBytesPerSec=self.counter('diskWriteBytesPerSec').get('_Total'),
                            gpus=[dict(id=k, dedicatedBytes=dedicated.get(k), sharedBytes=shared.get(k),

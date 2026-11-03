@@ -1,6 +1,7 @@
 """Related locations and explicitly selected Windows windows. Standard library only."""
 import ctypes as C
 from ctypes import wintypes as W
+import functools
 import os
 import ntpath
 import hashlib
@@ -43,16 +44,19 @@ def same_window_executable(left, right):
     relative executable. Only the four-part package version may change.
     This is discovery identity; live PID/created/exe checks remain exact.
     """
-    def key(path):
-        path = ntpath.normcase(ntpath.normpath(path or ''))
-        root = ntpath.normcase(ntpath.join(os.environ.get('ProgramFiles', r'C:\Program Files'), 'WindowsApps')) + '\\'
-        if path.startswith(root):
-            package, sep, relative = path[len(root):].partition('\\')
-            match = re.fullmatch(r'([^_]+)_\d+\.\d+\.\d+\.\d+_([^_]+)_([^_]*)_([^_]+)', package)
-            if match and sep and relative:
-                return (root, *match.groups(), relative)
-        return path
-    return bool(left and right) and key(left) == key(right)
+    return bool(left and right) and _window_exe_key(left) == _window_exe_key(right)
+
+
+@functools.lru_cache(maxsize=4096)
+def _window_exe_key(path):
+    path = ntpath.normcase(ntpath.normpath(path or ''))
+    root = ntpath.normcase(ntpath.join(os.environ.get('ProgramFiles', r'C:\Program Files'), 'WindowsApps')) + '\\'
+    if path.startswith(root):
+        package, sep, relative = path[len(root):].partition('\\')
+        match = re.fullmatch(r'([^_]+)_\d+\.\d+\.\d+\.\d+_([^_]+)_([^_]*)_([^_]+)', package)
+        if match and sep and relative:
+            return (root, *match.groups(), relative)
+    return path
 
 
 def browser_card_rule(api, app):
@@ -234,6 +238,30 @@ def capture_instance_match(api, app, pid):
     return rule
 
 
+def owned_by_current_user(api, pid, row):
+    lookup = getattr(api, 'snapshot_process_uid', None)
+    uid = lookup(pid, row.get('identity')) if lookup else api.process_uid(pid)
+    return uid == api.SELF_UID
+
+
+_PROCESS_SERVICE_IDENTITY = {}
+
+
+def process_service_identity(api, pid, row):
+    """A live process keeps its argv and cwd, so its resolved entry is reused
+    until the PID/creation time pair disappears; realpath is the hot cost."""
+    cwd = api._win_cwd(pid)
+    key = (pid, row.get('identity'), row.get('args') or '', cwd, row.get('exe'))
+    cache = _PROCESS_SERVICE_IDENTITY
+    if key in cache:
+        return cache[key]
+    value = service_identity(api, row.get('args') or '', cwd, row.get('exe'))
+    if len(cache) >= 2048:
+        cache.clear()
+    cache[key] = value
+    return value
+
+
 def instance_candidates(api, rule, within=None):
     table = api._win_process_table()
     service = rule.get('service')
@@ -249,13 +277,13 @@ def instance_candidates(api, rule, within=None):
             continue
         if pid == api.SELF_PID or not row.get('exe'):
             continue
-        if not row.get('identity') or api.process_uid(pid) != api.SELF_UID:
+        if not row.get('identity'):
             continue
         if service:
             runtime = os.path.basename(row['exe']).lower()
             if not (runtime.startswith('python') if service['runtime'] == 'python' else runtime == service['runtime'] + '.exe'):
                 continue
-            actual = service_identity(api, row.get('args') or '', api._win_cwd(pid), row['exe'])
+            actual = process_service_identity(api, pid, row)
             # cwd resolves relative script entries; the launcher directory is not
             # identity once the same absolute entry and effective args are known.
             if not actual or {k: v for k, v in actual.items() if k != 'project'} != {k: v for k, v in service.items() if k != 'project'}:
@@ -279,6 +307,10 @@ def instance_candidates(api, rule, within=None):
                 continue
             if rule.get('cwd') and os.path.normcase(api._win_cwd(pid) or '') != os.path.normcase(rule['cwd']):
                 continue
+        # Owner lookup opens the process token; run it only for candidates
+        # that already passed the cheap executable/argument filters.
+        if not owned_by_current_user(api, pid, row):
+            continue
         matches.append(pid)
     # Electron/browser helpers share the executable: keep independent roots only.
     roots = []
@@ -350,7 +382,7 @@ def refresh_instance(api, cfg, app):
                     runtime = os.path.basename(row.get('exe') or '').lower()
                     if not (runtime.startswith('python') if service['runtime'] == 'python' else runtime == 'node.exe'):
                         continue
-                    if api.process_uid(pid) != api.SELF_UID:
+                    if not owned_by_current_user(api, pid, row):
                         continue
                     current = service_identity(api, row.get('args'), api._win_cwd(pid), row.get('exe'))
                     if current and {k: v for k, v in current.items() if k != 'argsHash'} == service:
@@ -436,7 +468,13 @@ def open_location(action):
     return {'ok': True}
 
 
+_WINDOW_API = None
+
+
 def window_api():
+    global _WINDOW_API
+    if _WINDOW_API is not None:
+        return _WINDOW_API
     user = C.WinDLL('user32', use_last_error=True)
     user.GetWindowThreadProcessId.argtypes = [W.HWND, C.POINTER(W.DWORD)]
     user.SetPropW.argtypes = [W.HWND, W.LPCWSTR, W.HANDLE]
@@ -454,6 +492,7 @@ def window_api():
     user.PeekMessageW.argtypes = [C.POINTER(W.MSG), W.HWND, W.UINT, W.UINT, W.UINT]
     user.GetClassNameW.argtypes = [W.HWND, W.LPWSTR, C.c_int]
     user.GetWindowLongW.argtypes = [W.HWND, C.c_int]
+    _WINDOW_API = user
     return user
 
 
@@ -461,11 +500,18 @@ def list_windows(api, include_hidden=False):
     if not api.IS_WIN:
         return []
     from win_metrics import windows
-    table = api._win_process_table(refresh=True)
+    found = windows(include_hidden=include_hidden)
+    table = api._win_process_table()
+    native = getattr(api, '_NATIVE_METRICS', None)
+    seen = getattr(native, 'seen_pids', None) or set()
+    # Reuse the shared snapshot unless a window belongs to a process it has
+    # never seen; inaccessible processes stay absent and must not force resampling.
+    if any(pid not in table and pid not in seen for pid in found if pid != api.SELF_PID):
+        table = api._win_process_table(refresh=True)
     result = []
-    for pid, items in windows(include_hidden=include_hidden).items():
+    for pid, items in found.items():
         row = table.get(pid)
-        if pid == api.SELF_PID or not row or not row.get('exe') or api.process_uid(pid) != api.SELF_UID:
+        if pid == api.SELF_PID or not row or not row.get('exe') or not owned_by_current_user(api, pid, row):
             continue
         for hwnd, title in items:
             user = window_api()

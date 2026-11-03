@@ -9,10 +9,42 @@ from unittest import mock
 
 import server
 from ops_model import DEFAULT_RULES, local_url, http_action, validate_app_extra, validate_rules, validate_presets
-from ops_monitor import Alerts, Monitor, directory_size
+from ops_monitor import Alerts, Monitor, STOPPED_MATCH_INTERVAL_SEC, directory_size
 
 
 class Contracts(unittest.TestCase):
+    def test_monitor_startup_failure_and_recovery(self):
+        cfg = types.SimpleNamespace(
+            snapshot=lambda: dict(apps=[], rules=[], ignoredAlerts={}, alertOverrides={}),
+            health_info=lambda: {})
+        host = types.SimpleNamespace(cfg=cfg, console_port=9600)
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(server, 'LOGS_DIR', td):
+            monitor = Monitor(host, server, notifications=False)
+            try:
+                initial = monitor.snapshot()
+                self.assertFalse(initial['degraded'])
+                self.assertEqual(initial['degradedReasons'], [])
+                self.assertIsNone(initial['sampledAt'])
+                self.assertTrue(initial['stale'])
+
+                def fail():
+                    monitor.stopped.set()
+                    monitor.wake.set()
+                    raise RuntimeError('collect failed')
+                with mock.patch.object(monitor, 'collect', side_effect=fail), mock.patch('ops_monitor.LOG'):
+                    monitor.loop()
+                self.assertTrue(monitor.snapshot()['degraded'])
+
+                ready = dict(apps=[], services=[], watched=[], degraded=False, degradedReasons=[])
+                with mock.patch.object(server, 'IS_WIN', False), mock.patch.object(server, 'build_state', return_value=ready):
+                    monitor.collect()
+                recovered = monitor.snapshot()
+                self.assertFalse(recovered['degraded'])
+                self.assertFalse(recovered['stale'])
+                self.assertIsNotNone(recovered['sampledAt'])
+            finally:
+                monitor.close()
+
     def test_v2_to_v3_preserves_new_fields_and_blocks_old_writer(self):
         buttons = [dict(action='stop', name='关闭', placement='primary', when='running')]
         ignored = {'app:aaaaaaaa:cpu': {'incident': 'saved-incident'}}
@@ -284,21 +316,41 @@ class SnapshotTests(unittest.TestCase):
     def test_resources_are_deduplicated_and_unknown_does_not_mean_zero(self):
         import threading
         m = Monitor.__new__(Monitor)
-        app = dict(id='a', running=True, pids=[11, 11, 12], kind='service')
+        app = dict(id='a', name='Example', running=True, pids=[11, 11, 12], kind='service')
         m.cfg = types.SimpleNamespace(snapshot=lambda: {'apps': [app]}, health_info=lambda: {})
         m.host = types.SimpleNamespace(console_port=9600)
         m.api = types.SimpleNamespace(IS_WIN=True, find_app=lambda c, ident: app,
             _simple_command_tokens=server._simple_command_tokens,
             MANUAL_STOP_LOCK=threading.RLock(), MANUAL_STOP_TOKENS=set(),
-            build_state=lambda *args: {'apps': [app]}, _NATIVE_METRICS=types.SimpleNamespace(system={}),
+            build_state=lambda *args: {'apps': [app]}, _NATIVE_METRICS=types.SimpleNamespace(system={}, seen_pids={11, 12}),
             _win_process_table=lambda: {11: {'cpu': 1, 'ws': 10, 'ioWriteBytes': 20}, 12: {'cpu': None, 'ws': 30, 'ioWriteBytes': 40}})
         m.async_checks = m.check_apps = m.check_system = lambda *args: None
         m.directories, m.state = {}, {}
         m.directory_snapshots, m.snapshot_job = {}, None
+        m.match_seen, m.match_at = set(), {}
         m.alerts = Alerts(lambda e: None)
         m.lock = threading.Lock()
         m.collect()
-        self.assertEqual(app['resources'], {'cpu': None, 'memoryBytes': 40, 'gpuMemoryBytes': None, 'ioWriteBytes': 60})
+        self.assertEqual(app['resources'], {'cpu': None, 'memoryBytes': 40, 'privateBytes': None, 'gpuMemoryBytes': None, 'ioWriteBytes': 60})
+
+    def test_stopped_card_rematch_waits_for_candidate_process_or_interval(self):
+        m = Monitor.__new__(Monitor)
+        m.match_seen, m.match_at = set(), {}
+        table = {1: dict(identity='1', exe=r'C:\Apps\Tool.exe'), 2: dict(identity='2', exe=r'C:\Py\python.exe')}
+        m.api = types.SimpleNamespace(_win_process_table=lambda: table)
+        desktop, service = dict(exe=r'C:\Apps\Tool.exe'), dict(service=dict(runtime='python'))
+        new = m.new_process_executables()
+        self.assertEqual(new, {'tool.exe', 'python.exe'})
+        self.assertTrue(m.match_due('a', desktop, new, 100))
+        self.assertTrue(m.match_due('b', service, new, 100))
+        new = m.new_process_executables()
+        self.assertEqual(new, set())
+        self.assertFalse(m.match_due('a', desktop, new, 105))
+        self.assertTrue(m.match_due('a', desktop, new, 100 + STOPPED_MATCH_INTERVAL_SEC))
+        table[3] = dict(identity='3', exe=r'C:\Py\pythonw.exe')
+        new = m.new_process_executables()
+        self.assertFalse(m.match_due('a', desktop, new, 111))
+        self.assertTrue(m.match_due('b', service, new, 101))
 
     def test_requests_only_read_shared_snapshot(self):
         monitor = mock.Mock()

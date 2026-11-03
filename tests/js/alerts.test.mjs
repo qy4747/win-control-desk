@@ -3,6 +3,29 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 
+test('memory coverage never presents unreadable, disabled or stale monitoring as healthy', () => {
+  const source = readFileSync(new URL('../../static/js/ops.js', import.meta.url), 'utf8');
+  const context = vm.createContext({});
+  vm.runInContext(source.slice(source.indexOf('function memoryHealth('), source.indexOf('async function executeAction(')), context);
+  const data = { sampledAt: 1, rules: [{ metric: 'processPrivateBytes', processScope: 'all' }],
+    system: { commitPercent: 50, processMemoryCoverage: { total: 100, readable: 98 } } };
+  assert.equal(context.memoryHealth(data).partial, true);
+  assert.match(context.memoryHealth(data).detail, /98 \/ 100.*不可读取 2/);
+  data.system.processMemoryCoverage.readable = 100;
+  assert.equal(context.memoryHealth(data).partial, false);
+  assert.match(context.memoryHealth(data).label, /已监测项/);
+  data.stale = true;
+  assert.match(context.memoryHealth(data).label, /待更新/);
+  data.stale = false; data.system.commitPercent = null;
+  assert.equal(context.memoryHealth(data).partial, true);
+  data.rules = [{ metric: 'processPrivateBytes', processScope: 'console' }];
+  assert.match(context.memoryHealth(data).label, /未启用/);
+  vm.runInContext(source.slice(source.indexOf('function alertValue('), source.indexOf('function alertControls(')), context);
+  context.bytes = n => `${n / 1024 ** 3} GiB`;
+  assert.equal(context.alertValue({ metric: 'processPrivateBytes' }, 7 * 1024 ** 3), '7 GiB');
+  assert.equal(context.alertValue({ metric: 'commitPercent' }, 85), '85.0%');
+});
+
 test('ignored app alerts disappear without recreating their configuration warning', () => {
   const source = readFileSync(new URL('../../static/js/ops.js', import.meta.url), 'utf8');
   const context = vm.createContext({});

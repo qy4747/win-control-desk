@@ -309,9 +309,13 @@ function renderTips(data) {
 /* ---------------- 主入口（每轮轮询调用） ---------------- */
 export function renderWidgets(data) {
   if (!data) return;
-  const next = snapshotMaps(data);
-  if (prevSnap) diffSnapshot(prevSnap, next);
-  prevSnap = next;
+  if (data.sampledAt === null) {
+    resetFeedBaseline();
+  } else {
+    const next = snapshotMaps(data);
+    if (prevSnap) diffSnapshot(prevSnap, next);
+    prevSnap = next;
+  }
   renderFeeds();
   renderTopPortsInto(topPortsL, data);
   renderTopPortsInto(topPortsS, data);

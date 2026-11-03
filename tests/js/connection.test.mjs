@@ -13,7 +13,7 @@ test('health notices stay connected; failures, restart and stop stay disconnecte
       toggle: (name, on) => on ? classes.add(name) : classes.delete(name) } };
   }
   const banner = node(), railConnDot = node(), railConnText = node();
-  const state = { data: { schemaVersion: 8, configHealth: { migratedFromSchema: 7 } } };
+  const state = { data: { schemaVersion: 8, sampledAt: null, configHealth: { migratedFromSchema: 7 } } };
   const notices = [], saved = new Map();
   let observed;
   const context = vm.createContext({ banner, state, railConnDot, railConnText,
@@ -27,6 +27,11 @@ test('health notices stay connected; failures, restart and stop stay disconnecte
   assert.equal(observed.join(), 'data-connection');
   context.connect(true);
   assert.equal(railConnText.textContent, '已连接');
+  assert.match(banner.textContent, /正在采集/);
+  assert.doesNotMatch(banner.textContent, /降级运行/);
+  assert.equal(banner.classList.contains('show'), true);
+  state.data.sampledAt = 1;
+  context.connect(true);
   assert.equal(banner.classList.contains('show'), false);
   assert.match(notices[0].message, /配置已从旧版本升级/);
   assert.equal(notices[0].duration, 4000);
@@ -45,6 +50,10 @@ test('health notices stay connected; failures, restart and stop stay disconnecte
   context.connect(true);
   assert.equal(railConnText.textContent, '已连接');
   assert.match(banner.textContent, /降级运行/);
+  state.data.sampledAt = null;
+  context.connect(true);
+  assert.match(banner.textContent, /降级运行/);
+  assert.doesNotMatch(banner.textContent, /正在采集/);
   for (const flag of ['restartingFrom', 'stopping']) {
     state[flag] = true;
     banner.textContent = '正在执行';
@@ -56,4 +65,34 @@ test('health notices stay connected; failures, restart and stop stay disconnecte
     context.connect(true);
     assert.equal(railConnText.textContent, '已连接');
   }
+});
+
+test('startup snapshot waits for a baseline before reporting new services', () => {
+  const services = readFileSync(new URL('../../static/js/services.js', import.meta.url), 'utf8');
+  const widgets = readFileSync(new URL('../../static/js/widgets.js', import.meta.url), 'utf8');
+  const notices = [], events = [];
+  const noop = () => {};
+  const context = vm.createContext({
+    configuredPort: app => app.port, actualPorts: app => app.ports || [],
+    toast: message => notices.push(message), pushEvent: (_, title) => events.push(title),
+    renderFeeds: noop, renderTopPortsInto: noop, renderTopRes: noop, renderTips: noop,
+    setText: noop, refreshCenterPages: noop, topPortsL: {}, topPortsS: {}, railVer: {},
+  });
+  const code = 'const discoverySeenKeys = new Set(), discoveryItems = new Map(); ' +
+    'let discoveryNeedsBaseline = true, prevSnap = null;\n' +
+    services.slice(services.indexOf('function serviceSnapshotHealthy'), services.indexOf('function openServiceAppModal')) +
+    widgets.slice(widgets.indexOf('export function resetFeedBaseline'), widgets.indexOf('const feedListL')) +
+    widgets.slice(widgets.indexOf('function snapshotMaps'), widgets.indexOf('function pushEvent')) +
+    widgets.slice(widgets.indexOf('function diffSnapshot'), widgets.indexOf('function feedItem')) +
+    widgets.match(/export function renderWidgets\(data\) \{[\s\S]*?\n\}/)[0];
+  vm.runInContext(code.replaceAll('export ', ''), context);
+  const update = data => { context.observePortDiscovery(data); context.renderWidgets(data); };
+  update({ apps: [], services: [], sampledAt: null, degraded: false });
+  const existing = { instanceKey: '1:8000', name: 'existing', port: 8000, group: 'mine' };
+  update({ apps: [], services: [existing], sampledAt: 1, degraded: false });
+  assert.deepEqual(notices, []);
+  assert.deepEqual(events, []);
+  update({ apps: [], services: [existing, { ...existing, instanceKey: '2:8001', name: 'new', port: 8001 }], sampledAt: 2 });
+  assert.equal(notices.length, 1);
+  assert.deepEqual(events, ['new 服务已启动']);
 });

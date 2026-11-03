@@ -249,6 +249,8 @@ function stateHealthNotice(data) {
       .map(item => HEALTH_COMPONENT_NAMES[item && item.component] || '部分组件'))];
     messages.push('降级运行：' + (components.length ? components.join('、') : '部分组件') +
       '数据可能不完整');
+  } else if (data.sampledAt === null) {
+    messages.push('正在采集应用与服务状态');
   }
   if (health.writable === false) {
     messages.push('配置处于只读保护，修改不会保存');

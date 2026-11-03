@@ -399,6 +399,18 @@ while u.GetMessageW(C.byref(m),None,0,0)>0:
             user.SetForegroundWindow.assert_not_called()
 
     @unittest.skipUnless(server.IS_WIN, 'Windows native window')
+    def test_process_service_identity_is_reused_until_process_instance_changes(self):
+        api = types.SimpleNamespace(_win_cwd=lambda pid: r'H:\proj')
+        row = dict(identity=111, args='python.exe app.py', exe=r'C:\py\python.exe')
+        entries._PROCESS_SERVICE_IDENTITY.clear()
+        with mock.patch.object(entries, 'service_identity', return_value={'runtime': 'python'}) as resolve:
+            first = entries.process_service_identity(api, 4242, row)
+            self.assertEqual(first, entries.process_service_identity(api, 4242, row))
+            self.assertEqual(resolve.call_count, 1)
+            entries.process_service_identity(api, 4242, dict(row, identity=222))
+            self.assertEqual(resolve.call_count, 2)
+        entries._PROCESS_SERVICE_IDENTITY.clear()
+
     def test_native_binding_and_destroyed_window_property(self):
         # Create only our own small test window; never change another application.
         user = entries.window_api()

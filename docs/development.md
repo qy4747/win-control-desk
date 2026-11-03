@@ -47,7 +47,7 @@
 
 ## 配置
 
-当前 `schemaVersion` 为 **8**；定义见 `server.py` 的 `CURRENT_SCHEMA_VERSION`，完整默认值见 `Config.DEFAULT`、`Config.APP_DEFAULT` 与 `ops_model.APP_FIELDS`。
+当前 `schemaVersion` 为 **9**；定义见 `server.py` 的 `CURRENT_SCHEMA_VERSION`，完整默认值见 `Config.DEFAULT`、`Config.APP_DEFAULT` 与 `ops_model.APP_FIELDS`。
 
 顶层保存卡片与服务标记、主题、规则/场景、告警忽略与覆盖、文件夹/搜索设置及目录快照。运行身份由后端生成；窗口绑定和实例规则通过专用 API 保存。
 

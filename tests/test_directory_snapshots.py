@@ -119,7 +119,7 @@ class DirectorySnapshots(unittest.TestCase):
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump(dict(schemaVersion=7, apps=[], rules=[]), f)
             cfg = server.Config(path)
-            self.assertEqual(cfg.snapshot()['schemaVersion'], 8)
+            self.assertEqual(cfg.snapshot()['schemaVersion'], server.CURRENT_SCHEMA_VERSION)
             self.assertEqual(cfg.snapshot()['directorySnapshots'], {})
 
 

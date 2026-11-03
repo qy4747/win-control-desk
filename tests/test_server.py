@@ -1060,6 +1060,68 @@ class LogTests(unittest.TestCase):
                 f.write(b"five\nsix\n")
             self.assertEqual(server.read_log_tail("a", 3), "four\nfive\nsix")
 
+    def test_idle_keepalive_timeout_is_not_logged(self):
+        handler = object.__new__(server.Handler)
+        handler.client_address = ('127.0.0.1', 1234)
+        with mock.patch.object(server.sys.stderr, 'write') as write:
+            handler.log_error('Request timed out: %r', TimeoutError('timed out'))
+            write.assert_not_called()
+            handler.log_error('code %d, message %s', 400, 'Bad request')
+            write.assert_called_once()
+
+    def test_reading_log_tail_never_rotates(self):
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(server, "LOGS_DIR", td):
+            path = os.path.join(td, "a.log")
+            with open(path, "wb") as f:
+                f.write(b"x" * 64 + b"\nlast\n")
+            with mock.patch.object(server, "MAX_LOG_BYTES", 8):
+                self.assertEqual(server.read_log_tail("a", 1), "last")
+            self.assertFalse(os.path.exists(path + ".1"))
+
+    def test_zero_filled_log_backup_keeps_only_real_tail(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "a.log")
+            with open(path, "wb") as f:
+                f.write(b"\0" * 300000 + b"real tail\n")
+            self.assertTrue(server.rotate_log_file(path, max_bytes=1024, backups=2))
+            with open(path + ".1", "rb") as f:
+                self.assertEqual(f.read(), b"real tail\n")
+            self.assertEqual(os.path.getsize(path), 0)
+
+    @unittest.skipUnless(server.IS_WIN, "Windows inherited handle semantics")
+    def test_child_log_writes_follow_truncation(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "a.log")
+            logf = server.open_append_log(path)
+            child = subprocess.Popen(
+                [sys.executable, "-c",
+                 "import sys,time\n"
+                 "for i in range(30):\n"
+                 " sys.stdout.write('line %02d\\n' % i); sys.stdout.flush(); time.sleep(0.02)"],
+                stdout=logf, stderr=subprocess.STDOUT)
+            logf.close()
+            time.sleep(0.3)
+            with open(path, "r+b") as f:
+                f.truncate(0)
+            child.wait(timeout=10)
+            with open(path, "rb") as f:
+                data = f.read()
+            self.assertNotIn(b"\0", data)
+            self.assertTrue(data.endswith(b"line 29\n") or data.endswith(b"line 29\r\n"))
+
+    @unittest.skipUnless(server.IS_WIN, "Windows native metrics")
+    def test_cpu_baseline_survives_back_to_back_samples(self):
+        from win_metrics import Metrics
+        metrics = Metrics()
+        metrics.sample()
+        first = metrics.previous.copy()
+        metrics.sample()
+        own = [key for key in first if key[0] == os.getpid()]
+        self.assertTrue(own)
+        self.assertEqual(metrics.previous[own[0]], first[own[0]])
+        self.assertIsNone(metrics.table[os.getpid()]['cpu'])
+
 
 class IconTests(unittest.TestCase):
     def test_all_allowed_icon_extensions_have_mime_types(self):

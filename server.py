@@ -57,6 +57,10 @@ if sys.platform == "win32":
         wintypes.HANDLE, wintypes.LPCVOID, wintypes.LPVOID,
         ctypes.c_size_t, ctypes.c_void_p]
     _KERNEL32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _KERNEL32.CreateFileW.restype = wintypes.HANDLE
+    _KERNEL32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
     _KERNEL32.CloseHandle.restype = wintypes.BOOL
     _KERNEL32.GetExitCodeProcess.restype = wintypes.BOOL
     _KERNEL32.GetExitCodeProcess.argtypes = [wintypes.HANDLE,
@@ -161,7 +165,7 @@ THEMES_DIR = os.path.join(STATIC_DIR, "themes")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 INSTANCE_LOCK_PATH = os.path.join(DATA_DIR, "console.lock")
 
-CURRENT_SCHEMA_VERSION = 8
+CURRENT_SCHEMA_VERSION = 9
 
 # 默认 UI 主题：新安装与无偏好回退均使用它，主题清单中固定排首位。
 DEFAULT_UI_THEME = "ops"
@@ -504,10 +508,20 @@ def migrate_config_v7_to_v8(raw):
     return raw
 
 
+def migrate_config_v8_to_v9(raw):
+    from ops_model import MEMORY_RULES
+    rules = raw.setdefault('rules', [])
+    ids = {r['id'] for r in rules}
+    rules.extend(copy.deepcopy(r) for r in MEMORY_RULES if r['id'] not in ids)
+    raw['schemaVersion'] = 9
+    return raw
+
+
 CONFIG_MIGRATIONS = {0: migrate_config_v0_to_v1, 1: migrate_config_v1_to_v2,
                      2: migrate_config_v2_to_v3, 3: migrate_config_v3_to_v4,
                      4: migrate_config_v4_to_v5, 5: migrate_config_v5_to_v6,
-                     6: migrate_config_v6_to_v7, 7: migrate_config_v7_to_v8}
+                     6: migrate_config_v6_to_v7, 7: migrate_config_v7_to_v8,
+                     8: migrate_config_v8_to_v9}
 
 
 def migrate_config(raw):
@@ -563,6 +577,8 @@ class Config:
         self._migration_from = None
         self._health_issues = []
         self._data = self._load()
+        self._revision = 0
+        self._shared_apps = None
 
     @staticmethod
     def _payload(data):
@@ -659,6 +675,17 @@ class Config:
         with self._lock:
             return json.loads(json.dumps(self._data, ensure_ascii=False))
 
+    def shared_apps(self):
+        """返回 (revision, apps)：配置变更前共享同一份副本，调用方只读。"""
+        with self._lock:
+            revision = getattr(self, "_revision", 0)
+            cached = getattr(self, "_shared_apps", None)
+            if cached is None or cached[0] != revision:
+                cached = (revision, json.loads(json.dumps(
+                    self._data.get("apps", []), ensure_ascii=False)))
+                self._shared_apps = cached
+            return cached
+
     def health_info(self):
         with self._lock:
             return {
@@ -683,6 +710,7 @@ class Config:
                 # 先保存上一份良好内容，再替换主文件。
                 self._write_atomic(self._path + ".bak", previous_payload)
                 self._write_atomic(self._path, payload)
+                self._revision = getattr(self, "_revision", 0) + 1
             except Exception:
                 self._data = previous
                 raise
@@ -969,8 +997,23 @@ def _win_etime(created):
     return max(0, int(time.time() - created_ts))
 
 
+_WIN_CHILDREN_CACHE = {"table": None, "size": -1, "children": None}
+
+
 def _win_children_map(table):
-    """把进程快照一次转换为 ``ppid -> [pid]`` 索引。"""
+    """把进程快照一次转换为 ``ppid -> [pid]`` 索引；同一份快照只建一次。
+
+    缓存持有快照引用，id 不会被复用；返回值为共享索引，调用方只读。
+    """
+    cache = _WIN_CHILDREN_CACHE
+    if cache["table"] is table and cache["size"] == len(table):
+        return cache["children"]
+    children = _build_win_children_map(table)
+    cache.update(table=table, size=len(table), children=children)
+    return children
+
+
+def _build_win_children_map(table):
     children = {}
     for pid, info in table.items():
         ppid = info.get("ppid")
@@ -1716,22 +1759,54 @@ def _managed_candidates(app, groups):
 
 
 _PROCESS_CONFIG = None
+_SNAPSHOT_MEMO = {"table": None, "values": {}}
+_SNAPSHOT_MEMO_LOCK = threading.Lock()
+
+
+def snapshot_memo(table, key, compute):
+    """缓存只依赖同一份进程快照的派生结果；快照更换后整体失效。
+
+    持有快照引用，id 不会被复用。"""
+    with _SNAPSHOT_MEMO_LOCK:
+        if _SNAPSHOT_MEMO["table"] is not table:
+            _SNAPSHOT_MEMO.update(table=table, values={})
+        values = _SNAPSHOT_MEMO["values"]
+        if key in values:
+            return values[key]
+    value = compute()
+    with _SNAPSHOT_MEMO_LOCK:
+        if _SNAPSHOT_MEMO["table"] is table:
+            _SNAPSHOT_MEMO["values"][key] = value
+    return value
 
 
 def card_process_members(app, members, apps=None):
     """A registered child application is a boundary, not part of its launcher."""
     if not IS_WIN or not members:
         return list(members)
+    revision = None
     if apps is None:
-        apps = _PROCESS_CONFIG.snapshot()['apps'] if _PROCESS_CONFIG is not None else []
+        shared = getattr(_PROCESS_CONFIG, 'shared_apps', None)
+        if shared is not None:
+            revision, apps = shared()
+        else:
+            apps = _PROCESS_CONFIG.snapshot()['apps'] if _PROCESS_CONFIG is not None else []
     if not apps:
         return list(members)
-    from ops_entries import instance_candidates, same_window_executable
     table = _win_process_table()
     own_root = (app.get('externalIdentity') or {}).get('pid') or app.get('lastPgid') or app.get('lastPid')
     descendants = set(members) - {own_root}
     if not descendants:
         return list(members)
+    compute = lambda: _card_process_members(app, members, apps, table, descendants)
+    if revision is None:
+        return compute()
+    key = ('card-members', id(_PROCESS_CONFIG), revision, app.get('id'), own_root, frozenset(members))
+    return list(snapshot_memo(table, key, compute))
+
+
+def _card_process_members(app, members, apps, table, descendants):
+    from ops_entries import instance_candidates, same_window_executable
     excluded = set()
     for other in apps:
         if other.get('id') == app.get('id'):
@@ -1742,7 +1817,7 @@ def card_process_members(app, members, apps=None):
         roots = []
         if (root in descendants and row.get('identity') == identity.get('created')
                 and row.get('exe') and os.path.normcase(row['exe']) == os.path.normcase(identity.get('exe', ''))
-                and process_uid(root) == SELF_UID):
+                and snapshot_process_uid(root, row.get('identity')) == SELF_UID):
             roots = [root]
         elif other.get('runToken'):
             root = other.get('lastPgid') or other.get('lastPid')
@@ -1819,11 +1894,12 @@ def external_pids(app):
     row = table.get(pid, {})
     if (row.get('identity') != identity.get('created') or not row.get('exe')
             or os.path.normcase(row['exe']) != os.path.normcase(identity.get('exe', ''))
-            or process_uid(pid) != SELF_UID):
+            or snapshot_process_uid(pid, row.get('identity')) != SELF_UID):
         return []
     root_created = row['created']
     members = [p for p in _win_tree_of(pid, table)
-               if table.get(p, {}).get('created', 0) >= root_created and process_uid(p) == SELF_UID]
+               if table.get(p, {}).get('created', 0) >= root_created
+               and snapshot_process_uid(p, table[p].get('identity')) == SELF_UID]
     return card_process_members(app, members)
 
 
@@ -2228,6 +2304,28 @@ def list_themes():
 
 # ---------------------------------------------------------------- 进程/应用操作
 
+_OWNER_UID_CACHE = {}
+_OWNER_UID_CACHE_LOCK = threading.Lock()
+_OWNER_UID_CACHE_MAX = 8192
+
+
+def snapshot_process_uid(pid, identity):
+    """按原生快照中的 (pid, 创建时间) 缓存所有者；进程所有者在生命周期内不变，
+    PID 复用时创建时间不同，不会沿用旧结果。"""
+    if not IS_WIN or not identity:
+        return process_uid(pid)
+    key = (pid, identity)
+    with _OWNER_UID_CACHE_LOCK:
+        if key in _OWNER_UID_CACHE:
+            return _OWNER_UID_CACHE[key]
+    uid = process_uid(pid)
+    with _OWNER_UID_CACHE_LOCK:
+        if len(_OWNER_UID_CACHE) >= _OWNER_UID_CACHE_MAX:
+            _OWNER_UID_CACHE.clear()
+        _OWNER_UID_CACHE[key] = uid
+    return uid
+
+
 def process_uid(pid):
     """返回进程所有者身份；进程不存在或不可验证时返回 None。"""
     if IS_WIN:
@@ -2392,11 +2490,7 @@ def start_app(app, extra_env=None):
     rotate_log_file(log_path)
     cwd = app.get("cwd") or os.path.expanduser("~")
     try:
-        log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-                         0o600)
-        if hasattr(os, "fchmod"):
-            os.fchmod(log_fd, 0o600)
-        logf = os.fdopen(log_fd, "ab", buffering=0)
+        logf = open_append_log(log_path)
     except OSError as e:
         return False, "无法打开日志文件: %s" % e, None, None, None
     token = secrets.token_urlsafe(24)
@@ -3568,6 +3662,50 @@ def attach_app_process(cfg, app_id, app, pid):
 
 # ---------------------------------------------------------------- 日志
 
+def open_append_log(path):
+    """打开子进程继承的日志文件对象，写入始终落在文件末尾。
+
+    Windows CRT 的 O_APPEND 只在本进程内模拟，子进程继承的原始句柄仍按
+    自己的文件指针写入；copy-truncate 之后会在旧偏移处写入，中间被零填满。
+    只授予 FILE_APPEND_DATA（不含 FILE_WRITE_DATA）由内核保证追加。
+    """
+    if IS_WIN:
+        handle = _KERNEL32.CreateFileW(
+            path,
+            0x0004 | 0x0080 | 0x00100000,  # APPEND_DATA | READ_ATTRIBUTES | SYNCHRONIZE
+            0x1 | 0x2 | 0x4,  # FILE_SHARE_READ | WRITE | DELETE
+            None, 4, 0x80, None)  # OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL
+        if handle and handle != wintypes.HANDLE(-1).value:
+            import msvcrt
+            try:
+                fd = msvcrt.open_osfhandle(handle, os.O_APPEND)
+            except OSError:
+                _KERNEL32.CloseHandle(handle)
+                raise
+            return os.fdopen(fd, "ab", buffering=0)
+        LOG.warning("无法以追加模式打开日志，回退普通写入: %s (%s)",
+                    path, ctypes.get_last_error())
+    log_fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    if hasattr(os, "fchmod"):
+        os.fchmod(log_fd, 0o600)
+    return os.fdopen(log_fd, "ab", buffering=0)
+
+
+def _copy_log_backup(path, target, max_bytes):
+    """复制当前日志到备份；开头是零填充空洞时只保留末尾的真实内容。"""
+    with open(path, "rb") as src:
+        head = src.read(65536)
+        if head and not head.strip(b"\x00"):
+            # 旧版非追加句柄在截断后的旧偏移处续写，前面全是零；复制整份
+            # 文件只会制造同样大小的空洞备份。
+            size = src.seek(0, os.SEEK_END)
+            src.seek(max(0, size - max_bytes))
+            with open(target, "wb") as dst:
+                dst.write(src.read().lstrip(b"\x00"))
+            return
+    shutil.copyfile(path, target)
+
+
 def rotate_log_file(path, max_bytes=MAX_LOG_BYTES, backups=LOG_BACKUPS):
     """超限后 copy-truncate，保持子进程已打开的文件描述符继续可写。"""
     with LOG_LOCK:
@@ -3582,7 +3720,7 @@ def rotate_log_file(path, max_bytes=MAX_LOG_BYTES, backups=LOG_BACKUPS):
                 newer = "%s.%d" % (path, index)
                 if os.path.exists(older):
                     os.replace(older, newer)
-            shutil.copyfile(path, path + ".1")
+            _copy_log_backup(path, path + ".1", max_bytes)
             os.chmod(path + ".1", 0o600)
             with open(path, "r+b") as f:
                 f.truncate(0)
@@ -3618,7 +3756,6 @@ def _tail_file_lines(path, count, block_size=65536):
 def read_log_tail(app_id, count):
     """从当前日志和轮转备份中高效读取最后 count 行。"""
     path = os.path.join(LOGS_DIR, "%s.log" % app_id)
-    rotate_log_file(path)
     collected = []
     with LOG_LOCK:
         for candidate in [path] + ["%s.%d" % (path, i)
@@ -4192,6 +4329,12 @@ class Handler(BaseHTTPRequestHandler):
                     re.fullmatch(r"/api/apps/[^/]+/favicon", path)):
                 return
         super().log_request(code, size)
+
+    def log_error(self, fmt, *args):
+        # 空闲 keep-alive 连接到达 SOCKET_TIMEOUT_SEC 被回收属正常现象。
+        if fmt.startswith("Request timed out"):
+            return
+        super().log_error(fmt, *args)
 
     def log_message(self, fmt, *args):
         sys.stderr.write("%s - %s\n" % (self.client_address[0], fmt % args))

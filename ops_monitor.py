@@ -11,12 +11,13 @@ import threading
 import time
 import uuid
 
-from ops_model import http_action, number, script_command, preset_steps
+from ops_model import http_action, number, script_command, preset_steps, PROCESS_MEMORY_METRICS
 from ops_entries import refresh_instance, browser_card_rule, desktop_rule_upgrade_needed
 from win_notify import Notifier
 
 LOG = logging.getLogger('console')
 SNAPSHOT_METRIC = 'directorySnapshotGrowthBytes'
+STOPPED_MATCH_INTERVAL_SEC = 10
 
 
 def snapshot_slot(now, times):
@@ -94,7 +95,7 @@ class Alerts:
     def check(self, key, bad, value, rule, now, fail=1, recover=1, silent=False):
         state = self.states.setdefault(key, dict(active=False, since=None, failures=0, successes=0))
         state.update(title=rule['name'], value=value, target=rule.get('appId', 'system'), muted=rule.get('muted', False))
-        for field in ('metric', 'threshold', 'recoveryThreshold'):
+        for field in ('metric', 'threshold', 'recoveryThreshold', 'detail', 'process'):
             state[field] = rule.get(field)
         state['comparison'] = 'below' if rule.get('metric') == 'diskFreePercent' else 'above'
         state['ruleSignature'] = self.signature(rule)
@@ -108,11 +109,12 @@ class Alerts:
             if rule.get('threshold') is not None and value is not None:
                 recovery = rule.get('recoveryThreshold', rule['threshold'])
                 restored = value >= recovery if state['comparison'] == 'below' else value <= recovery
+            restored = restored or rule.get('conditionMet') is False
             override['recoveries'] = override.get('recoveries', 0) + 1 if restored else 0
             if override['recoveries'] >= recover:
                 self.overrides.pop(key)
                 override = None
-            elif override.get('threshold') is not None:
+            elif override.get('threshold') is not None and bad:
                 bad = value < override['threshold'] if state['comparison'] == 'below' else value > override['threshold']
         state['ignored'] = bool(override and (override['mode'] == 'permanent' or override.get('threshold') is None)) or state.get('ignored', False)
         if not override and state.get('overrideMode'):
@@ -135,7 +137,7 @@ class Alerts:
                 state['reported'] = not silent
                 if not silent:
                     self.emit(dict(key=key, target=state['target'], title=rule['name'], phase='alert',
-                                   value=value, detail=str(value), muted=state['muted'] or state['ignored']))
+                                   value=value, detail=rule.get('detail') or str(value), muted=state['muted'] or state['ignored']))
         else:
             state['since'], state['failures'] = None, 0
             state['successes'] += 1
@@ -147,7 +149,10 @@ class Alerts:
 
     @staticmethod
     def signature(rule):
-        return [rule.get(k) for k in ('metric', 'threshold', 'recoveryThreshold', 'durationSec')]
+        fields = ('metric', 'threshold', 'recoveryThreshold', 'durationSec')
+        if rule.get('metric') in PROCESS_MEMORY_METRICS:
+            fields += ('windowSec', 'processScope')
+        return [rule.get(k) for k in fields]
 
     def accept(self, key, incident, mode, threshold=None):
         state = self.states.get(key)
@@ -158,7 +163,7 @@ class Alerts:
         if mode == 'temporary' and state.get('threshold') is not None:
             if state.get('unknown') or state.get('value') is None:
                 raise ValueError('采集不可用，不能调整临时阈值')
-            high = 100 if state['metric'] in ('cpu', 'memoryPercent', 'gpuPercent', 'diskFreePercent') else 1e18
+            high = 100 if state['metric'] in ('cpu', 'memoryPercent', 'commitPercent', 'gpuPercent', 'diskFreePercent') else 1e18
             number(threshold, '临时阈值', high=high)
             if (state['comparison'] == 'below' and threshold > min(state['value'], state['threshold'])) or (state['comparison'] == 'above' and threshold < max(state['value'], state['threshold'])):
                 raise ValueError('临时阈值必须容纳当前读数，且不能比原阈值更严格')
@@ -198,8 +203,8 @@ class Monitor:
         self.lock = threading.RLock()
         self.wake, self.stopped = threading.Event(), threading.Event()
         self.last_active = 0
-        self.state = dict(apps=[], services=[], watched=[], degraded=True,
-                          degradedReasons=[{'component': 'apps'}], sampledAt=None)
+        self.state = dict(apps=[], services=[], watched=[], degraded=False,
+                          degradedReasons=[], sampledAt=None)
         self.events = collections.deque(maxlen=300)
         self.event_path = os.path.join(api.LOGS_DIR, 'events.jsonl')
         try:
@@ -217,6 +222,7 @@ class Monitor:
         self.exit_baseline = {}
         self.rule_next = {}
         self.histories = {}
+        self.match_seen, self.match_at = set(), {}
         self.disk_total = 0
         self.disk_time = None
         self.run = None
@@ -336,7 +342,8 @@ class Monitor:
                               (self.rule_next, {r['id'] for r in rules}),
                               (self.previous_config, active_apps), (self.exit_baseline, active_apps)):
             for key in list(mapping):
-                if key not in keep: mapping.pop(key)
+                owner = key[0] if mapping is self.histories and isinstance(key, tuple) else key
+                if owner not in keep: mapping.pop(key)
 
     def check_directory_snapshots(self, rules):
         paths = {}
@@ -394,6 +401,32 @@ class Monitor:
                     week=snapshot_delta(record.get('history', []), 604800))
                 for path, record in self.directory_snapshots.items()}
 
+    def new_process_executables(self):
+        """Executable names of processes that appeared since the previous round."""
+        table = self.api._win_process_table()
+        current = {(pid, row.get('identity')) for pid, row in table.items()}
+        fresh = {os.path.basename(row.get('exe') or '').lower()
+                 for pid, row in table.items() if (pid, row.get('identity')) not in self.match_seen}
+        self.match_seen = current
+        return fresh
+
+    def match_due(self, app_id, rule, new_exes, now):
+        """Rematch a stopped card when a candidate executable starts, otherwise
+        only every STOPPED_MATCH_INTERVAL_SEC so windows that appear later in
+        an existing process are still found."""
+        service = rule.get('service') or {}
+        runtime = service.get('runtime')
+        if runtime == 'python':
+            triggered = any(name.startswith('python') for name in new_exes)
+        elif runtime:
+            triggered = runtime + '.exe' in new_exes
+        else:
+            triggered = os.path.basename(rule.get('exe') or '').lower() in new_exes
+        if not triggered and now - self.match_at.get(app_id, float('-inf')) < STOPPED_MATCH_INTERVAL_SEC:
+            return False
+        self.match_at[app_id] = now
+        return True
+
     def loop(self):
         while not self.stopped.is_set():
             started = time.monotonic()
@@ -418,6 +451,7 @@ class Monitor:
         data = self.api.build_state(cfg, self.host.console_port, self.cfg.health_info())
         matches, changed = {}, False
         if self.api.IS_WIN and not data.get('degraded'):
+            new_exes = self.new_process_executables()
             for item in data['apps']:
                 rule = item.get('instanceMatch') or {}
                 service = rule.get('service') or {}
@@ -426,6 +460,8 @@ class Monitor:
                 needs_upgrade |= desktop_rule_upgrade_needed(item)
                 if not rule or (item['running'] and not needs_upgrade
                                 and not (item.get('backgroundOnly') and rule.get('windowClass'))):
+                    continue
+                if not item['running'] and not self.match_due(item['id'], rule, new_exes, now):
                     continue
                 lock = self.host.try_app_operation(item['id'])
                 if lock is None:
@@ -447,6 +483,7 @@ class Monitor:
         table = self.api._win_process_table() if self.api.IS_WIN else {}
         for service in data.get('services', []):
             service['gpuMemoryBytes'] = table.get(service['pid'], {}).get('gpuMemoryBytes')
+            service['privateBytes'] = table.get(service['pid'], {}).get('privateBytes')
         system = copy.deepcopy(self.api._NATIVE_METRICS.system) if self.api.IS_WIN and self.api._NATIVE_METRICS else {}
         valid = not data.get('degraded')
         if not data['apps'] and cfg['apps'] and not valid:
@@ -457,6 +494,7 @@ class Monitor:
             app['resources'] = dict(
                 cpu=sum(r['cpu'] for r in rows) if rows and all(r.get('cpu') is not None for r in rows) else None,
                 memoryBytes=sum(r['ws'] for r in rows) if rows and all(r.get('ws') is not None for r in rows) else None,
+                privateBytes=sum(r['privateBytes'] for r in rows) if rows and all(r.get('privateBytes') is not None for r in rows) else None,
                 gpuMemoryBytes=sum(r['gpuMemoryBytes'] for r in rows) if rows and all(r.get('gpuMemoryBytes') is not None for r in rows) else None,
                 ioWriteBytes=sum(r['ioWriteBytes'] for r in rows) if rows and all(r.get('ioWriteBytes') is not None for r in rows) else None)
             original = self.api.find_app(cfg, app['id'])
@@ -482,7 +520,11 @@ class Monitor:
                 app['lifecycleChanging'] = app['id'] in stopping or any(
                     before.get(key) != after.get(key) for key in lifecycle_fields)
             self.check_apps(data['apps'], now, valid)
-            self.check_system(system, cfg.get('rules', []), now)
+            native = self.api._NATIVE_METRICS if self.api.IS_WIN else None
+            self.check_system(system, cfg.get('rules', []), now,
+                              table if native else None, native.seen_pids if native else None,
+                              {pid: a['name'] for a in data['apps'] if a.get('statusKnown')
+                               for pid in a.get('pids', [])})
             ignored = self.alerts.ignored()
             if ignored != self.cfg.snapshot().get('ignoredAlerts', {}) or self.alerts.overrides != self.cfg.snapshot().get('alertOverrides', {}):
                 self.cfg.update(lambda c: c.update(ignoredAlerts=ignored, alertOverrides=copy.deepcopy(self.alerts.overrides)))
@@ -546,19 +588,114 @@ class Monitor:
                 check('cpu' if metric == 'cpu' else 'memory', bad, value, label, policy.get('durationSec', 60), metric=metric, threshold=threshold)
             app['alerts'] = self.alerts.active(ident)
 
-    def increment(self, key, value, now, window):
-        history = self.histories.setdefault(key, collections.deque(maxlen=9002))
+    def increment(self, key, value, now, window, points=9002):
+        history = self.histories.setdefault(key, collections.deque(maxlen=points))
         if value is None:
             history.clear()
             return None
-        # ponytail: bound a day's samples to 9002 points; long windows use ~10 s resolution.
-        if not history or now-history[-1][0] >= window/8999:
+        # ponytail: downsample to a bounded window; process trends use only 32 points.
+        if history and now-history[-1][0] > window:
+            history.clear()
+        if not history or now-history[-1][0] >= window/(points-3):
             history.append((now, value))
         while len(history) > 1 and history[1][0] <= now-window:
             history.popleft()
         return max(0, value-history[0][1]) if history and now-history[0][0] >= window else None
 
-    def check_system(self, system, rules, now):
+    def check_process_memory(self, rule, table, seen_pids, now, system=None, app_names=None):
+        prefix = 'rule:'+rule['id']+':'
+        live = set()
+        if table is not None:
+            for pid, row in table.items():
+                if not row.get('identity') or (rule.get('processScope') == 'console' and pid != self.api.SELF_PID):
+                    continue
+                token = str(pid)+'@'+row['identity']
+                live.add(token)
+                key = prefix+token
+                value = row.get('privateBytes')
+                if rule['metric'] == 'processPrivateGrowthBytes':
+                    value = self.increment((rule['id'], token), value, now, rule.get('windowSec', 1800), points=32)
+                old = self.alerts.states.get(key, {})
+                if old and now-old.get('observedAt', now) > max(30, rule.get('intervalSec', 10)*3):
+                    old.update(since=None, failures=0, successes=0)
+                threshold = rule.get('recoveryThreshold', rule['threshold']) if old.get('active') else rule['threshold']
+                if not old and key not in self.alerts.overrides and (value is None or value <= threshold):
+                    continue
+                bad = None if value is None else value > threshold
+                condition_met = True
+                reason = '超过总控台自身的内存预算' if rule.get('processScope') == 'console' else '进程提交内存观察'
+                if bad and rule['metric'] == 'processPrivateGrowthBytes':
+                    history = self.histories[(rule['id'], token)]
+                    start = history[0][1]
+                    window = rule.get('windowSec', 1800)
+                    anchors = [start] + [next((v for t, v in reversed(history) if t <= now-window*f), start)
+                                         for f in (2/3, 1/3)] + [row['privateBytes']]
+                    # Require meaningful relative growth spread over all thirds;
+                    # a one-off model/cache load followed by a plateau is not enough.
+                    bad = value >= start*.25 and all(b-a >= threshold*.1 for a, b in zip(anchors, anchors[1:]))
+                    condition_met = bad
+                    reason = '多个时间段持续增长，且相对窗口起点增长至少 25%'
+                elif bad and rule.get('processScope') != 'console':
+                    metrics = system or {}
+                    pressure = [metrics.get('commitPercent'), metrics.get('memoryPercent')]
+                    conditions = [None if n is None else n >= limit for n, limit in zip(pressure, (85, 90))]
+                    ws = row.get('ws')
+                    conditions.append(None if ws is None else value >= max(1, ws)*4)
+                    bad = True if any(c is True for c in conditions) else None if None in conditions else False
+                    condition_met = bad
+                    reason = '占用较高，且整机内存承压或提交量达到驻留量的 4 倍'
+                if not old and key not in self.alerts.overrides and bad is not True:
+                    continue
+                name = ('总控台' if pid == self.api.SELF_PID else (app_names or {}).get(pid))
+                services = []
+                native = getattr(self.api, '_NATIVE_METRICS', None)
+                if not name and native:
+                    services = native.service_names(pid, row['identity'])
+                    if len(services) == 1:
+                        name = services[0]['display'] or services[0]['name']
+                    elif services:
+                        name = '共享服务宿主（'+'、'.join(s['display'] or s['name'] for s in services[:2])+('等' if len(services) > 2 else '')+'）'
+                name = name or row.get('name') or '未知进程'
+                label = f"{name} · 内存需要检查"
+                def gib(n): return '未知' if n is None else f'{n/1024**3:.2f} GiB'
+                detail = f"{reason}；PID {pid} · 私有提交 {gib(row.get('privateBytes'))} · 驻留 {gib(row.get('ws'))}"
+                if services:
+                    detail += ' · 服务 '+', '.join(s['name'] for s in services)
+                    if len(services) > 1: detail += '（共享进程，不能据此定位其中某项服务）'
+                if rule['metric'] == 'processPrivateGrowthBytes':
+                    detail += f" · 约 {rule.get('windowSec', 1800)/60:g} 分钟净增长 {gib(value)}"
+                self.alerts.check(key, bad, value,
+                    dict(rule, name=label, detail=detail, conditionMet=condition_met, process=dict(pid=pid, created=row['identity'],
+                         name=name, privateBytes=row.get('privateBytes'), workingSetBytes=row.get('ws'))), now, recover=2)
+                state = self.alerts.states[key]
+                state['observedAt'] = now
+                if not state['active'] and state['since'] is None and key not in self.alerts.overrides:
+                    self.alerts.states.pop(key)
+        # Drop exited/reused identities and their histories; unreadable live PIDs
+        # retain an unknown incident, never a fabricated recovery.
+        for key in set(self.alerts.states) | set(self.alerts.overrides):
+            if not key.startswith(prefix) or key[len(prefix):] in live:
+                continue
+            token = key[len(prefix):]
+            pid_text, separator, _ = token.partition('@')
+            pid = int(pid_text) if separator and pid_text.isdecimal() else None
+            old = self.alerts.states.get(key)
+            if table is None or (pid in (seen_pids or ()) and pid not in table):
+                if old:
+                    self.alerts.check(key, None, None, dict(rule, name=old['title'],
+                        detail=old.get('detail'), process=old.get('process')), now)
+            else:
+                if old and old.get('active') and old.get('reported'):
+                    self.emit(dict(key=key, target='system', title=old['title']+' · 本次观察结束',
+                        phase='recovered', value=None, detail='原进程已退出或不再属于该规则范围',
+                        muted=old.get('muted') or old.get('ignored')))
+                self.alerts.states.pop(key, None)
+                self.alerts.overrides.pop(key, None)
+        for key in list(self.histories):
+            if isinstance(key, tuple) and key[0] == rule['id'] and key[1] not in live:
+                self.histories.pop(key)
+
+    def check_system(self, system, rules, now, processes=None, seen_pids=None, app_names=None):
         rate = system.get('diskWriteBytesPerSec')
         if self.disk_time is not None and rate is not None:
             self.disk_total += rate*max(0, now-self.disk_time)
@@ -588,6 +725,9 @@ class Monitor:
                 if isinstance(next_check, (int, float)) and now < next_check:
                     continue
                 self.rule_next[r['id']] = now+r.get('intervalSec', 10)
+            if metric in PROCESS_MEMORY_METRICS:
+                self.check_process_memory(r, processes, seen_pids, now, system, app_names)
+                continue
             values = {'system': system.get(metric)}
             if metric == 'diskFreePercent':
                 values = {d['path']: d['freePercent'] for d in system.get('disks', [])}
