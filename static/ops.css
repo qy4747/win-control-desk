@@ -326,11 +326,32 @@
 #settingsAppearance .set-row { padding: 8px 0 0; }
 #settingsAppearance .mini-tab { min-height: 32px; padding-inline: 12px; }
 #settingsMonitoring > .btn { margin: 4px 8px 4px 0; }
+/* The side widgets share the row with the table above 1280px, so the table's
+   own width (not the viewport) decides when the directory column must go. */
+#view-services .tbl:not(.tbl-watch) { container-type: inline-size; }
 @media (min-width: 701px) {
-  #view-services .tbl:not(.tbl-watch) .tr { min-width: 850px; gap: 8px; padding-inline: 12px; grid-template-columns: 20px minmax(125px, 1.4fr) 54px 64px minmax(80px, 1fr) 100px 58px 62px 126px; }
+  #view-services .tbl:not(.tbl-watch) .tr { min-width: 850px; gap: 8px; padding-inline: 12px; grid-template-columns: 20px minmax(125px, 1.4fr) 54px 64px minmax(80px, 1fr) 100px 58px 62px 136px; }
 }
 @media (min-width: 701px) and (max-width: 1080px) {
-  #view-services .tbl:not(.tbl-watch) .tr { min-width: 770px; grid-template-columns: 20px minmax(125px, 1.4fr) 54px 64px 100px 58px 62px 126px; }
+  #view-services .tbl:not(.tbl-watch) .tr { min-width: 770px; grid-template-columns: 20px minmax(125px, 1.4fr) 54px 64px 100px 58px 62px 136px; }
+}
+@media (min-width: 701px) {
+  @container (max-width: 860px) {
+    #view-services .tbl:not(.tbl-watch) .tr { min-width: 0; grid-template-columns: 20px minmax(125px, 1.4fr) 54px 64px 100px 58px 62px 136px; }
+    #view-services .tbl:not(.tbl-watch) .tr > .c-cwd { display: none; }
+  }
+  @container (max-width: 700px) {
+    #view-services .tbl:not(.tbl-watch) .tr { grid-template-columns: 20px minmax(110px, 1fr) 64px 100px 58px 62px 136px; }
+    #view-services .tbl:not(.tbl-watch) .tr > .c-pid { display: none; }
+  }
+  @container (max-width: 620px) {
+    #view-services .tbl:not(.tbl-watch) .tr { grid-template-columns: 20px minmax(110px, 1fr) 64px 100px 62px 136px; }
+    #view-services .tbl:not(.tbl-watch) .tr > .c-up { display: none; }
+  }
+  @container (max-width: 560px) {
+    #view-services .tbl:not(.tbl-watch) .tr { grid-template-columns: 20px minmax(90px, 1fr) 64px 100px 136px; }
+    #view-services .tbl:not(.tbl-watch) .tr > .c-status { display: none; }
+  }
 }
 @media (max-width: 1400px) {
   #view-services .ov-row { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
