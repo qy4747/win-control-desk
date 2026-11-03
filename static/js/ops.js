@@ -3,6 +3,8 @@ import { $, el, icon, setText, state, post, postWithTimeout, put, act, toast, op
 import { openConfirm, openLogs, openAppModal, getIconVer } from './overlays.js';
 import { preferredOpenPort, portIsOpenable } from './ports.js';
 import { topResources } from './resources.js';
+import { commitAdvice, commitTopRows } from './memory-advice.js';
+import { scenePlan } from './scene-plan.js';
 import { packageState, bindPackagePress } from './packages.js';
 import { bindPresetHover, renderPresetHover } from './preset-hover.js';
 import { initTagDrawer } from './tag-drawer.js';
@@ -373,7 +375,10 @@ function renderAlerts() {
     const s = data.system || {};
     const readings = section(content, '资源读数');
     note(readings, 'CPU ' + pct(s.cpu) + ' · 物理内存 ' + pct(s.memoryPercent) + '\n磁盘写入 ' + bytes(s.diskWriteBytesPerSec) + '/s');
-    note(readings, '整机提交 ' + bytes(s.commitBytes) + ' / ' + bytes(s.commitLimitBytes) + '（' + pct(s.commitPercent) + '）\n可用物理内存 ' + bytes(s.memoryAvailableBytes));
+    note(readings, '可用物理内存 ' + bytes(s.memoryAvailableBytes));
+    const advice = commitAdvice(data);
+    const commit = section(content, '提交内存与处理建议', !['normal', 'unknown'].includes(advice.level));
+    note(commit, advice.label + '\n' + advice.lines.join('\n'));
     note(readings, memoryHealth(data).detail);
     note(readings, '提醒综合占用、持续增长和系统压力，不等于已确认泄漏。进程规则包括总控台自身，不要求添加卡片；共享服务宿主按整个进程统计。');
     for (const d of s.disks || []) note(readings, d.path + ' 剩余 ' + bytes(d.freeBytes) + ' / ' + bytes(d.totalBytes));
@@ -866,10 +871,14 @@ function editPreset(preset = {}, drafts = {}, replace = false) {
   }, 'btn btn-accent'));
 }
 function confirmPreset(preset) {
-  const labels = { start: '启动', stop: '停止', keep: '保持不变' };
-  const groups = (preset.packageSteps || []).map(s => escapeHtml(labels[s.action] + '预设包 · ' + (state.data.presets.find(p => p.id === s.packageId)?.name || s.packageId)));
-  openConfirm({ title: '切换场景：' + preset.name, okText: '已保存工作，确认切换',
-    bodyHtml: '<p><b>请先保存当前工作。</b>切换可能关闭应用，未保存的内容可能丢失。</p><div class="confirm-detail">' + ([...groups, ...preset.steps.map(s => escapeHtml(labels[s.action] + ' · ' + (state.data.apps.find(a => a.id === s.appId)?.name || s.appId)))].join('<br>') || '只切换此场景的基线规则。') + '</div><p>先关闭，再启动。完成后不会强制维持应用运行。</p>',
+  const plan = scenePlan(preset, state.data);
+  const list = (label, names) => names.length ? '<p><b>' + label + '（' + names.length + '）</b><br>' + names.map(escapeHtml).join('、') + '</p>' : '';
+  const body = list('将关闭', plan.stop) + list('将启动', plan.start) + list('无需变化', plan.skipped) +
+    (plan.missing.length ? '<p>' + plan.missing.length + ' 项应用已删除，将跳过。</p>' : '');
+  const closing = plan.stop.length;
+  openConfirm({ title: '切换场景：' + preset.name, okText: closing ? '已保存工作，确认切换' : '确认切换',
+    bodyHtml: (closing ? '<p><b>请先保存这些应用中的工作。</b>关闭后未保存的内容可能丢失。</p>' : '<p>本次切换不会关闭任何正在运行的应用。</p>') +
+      '<div class="confirm-detail">' + (body || '应用状态都已符合此场景，只切换基线规则。') + '</div><p>先关闭，再启动。完成后不会强制维持应用运行。</p>',
     onOk: async () => { const r = await act(post('/api/ops/presets/run', { id: preset.id })); if (r?.ok) { selectedPreset = null; toast('正在切换场景'); await window.__poll(); } },
   });
 }
@@ -977,7 +986,10 @@ function scheduleMetricsHide() {
 }
 function renderResourcePopover(data) {
   for (const bar of metricBars) {
-    const group = { label: bar.label, metric: bar.metric, total: bar.value.textContent, rows: topResources(data, bar.metric) };
+    const commit = bar.metric === 'commitBytes';
+    const advice = commit ? commitAdvice(data) : null;
+    const group = { label: bar.label, metric: bar.metric, total: bar.value.textContent,
+      rows: commit ? commitTopRows(data) : topResources(data, bar.metric), advice: advice && advice.level !== 'normal' ? advice.label : null };
     const signature = JSON.stringify([group, !!data.stale]);
     if (bar.popover.dataset.signature === signature) continue;
     bar.popover.dataset.signature = signature;
@@ -996,6 +1008,7 @@ function renderResourcePopover(data) {
       const value = el('span', 'ops-resource-value mono'); value.textContent = group.metric === 'cpu' ? pct(item[group.metric]) : bytes(item[group.metric]);
       row.append(rank, name, value); section.append(row);
     });
+    if (group.advice) note(section, group.advice + '，点击查看处理建议');
     bar.popover.replaceChildren(header, section);
   }
   placeMetricsPopover();
@@ -1082,8 +1095,9 @@ export function initOps() {
   const overview = el('div', 'ops-performance');
   metricsSummary = el('div', 'ops-metrics');
   metricsSummary.setAttribute('role', 'group'); metricsSummary.setAttribute('aria-label', '系统资源');
-  for (const [label, metric] of [['CPU', 'cpu'], ['内存', 'memoryBytes'], ['显存', 'gpuMemoryBytes']]) {
+  for (const [label, metric] of [['CPU', 'cpu'], ['内存', 'memoryBytes'], ['提交', 'commitBytes'], ['显存', 'gpuMemoryBytes']]) {
     const node = button('', () => { closeMetricsPopover(); openAlerts('system'); }, 'ops-metric');
+    node.dataset.metric = metric;
     const popover = el('div', 'ops-resource-popover'); popover.id = 'opsResourcePopover-' + metric;
     popover.setAttribute('popover', 'manual'); popover.setAttribute('role', 'tooltip');
     document.body.append(popover); node.setAttribute('aria-describedby', popover.id);
@@ -1155,7 +1169,8 @@ export function renderOps(data) {
   const capacity = hasCapacity ? gpus.reduce((sum, g) => sum + g.capacityBytes, 0) : GPU_CAPACITY_BYTES;
   updateMetricBar(metricBars[0], s.cpu);
   updateMetricBar(metricBars[1], s.memoryPercent);
-  updateMetricBar(metricBars[2], readable.length ? gpuBytes / capacity * 100 : null,
+  updateMetricBar(metricBars[2], s.commitPercent, '—', Number.isFinite(s.commitBytes) ? bytes(s.commitBytes) + ' / ' + bytes(s.commitLimitBytes) : '提交内存读数不可用');
+  updateMetricBar(metricBars[3], readable.length ? gpuBytes / capacity * 100 : null,
     '—', readable.length ? bytes(gpuBytes) + ' / ' + bytes(capacity) + (hasCapacity ? '' : '（用户指定容量）') : '显存读数不可用');
   renderResourcePopover(data);
   const presets = (data.presets || []).filter(p => p.type !== 'package');

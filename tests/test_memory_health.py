@@ -184,7 +184,8 @@ class MemoryHealthTests(unittest.TestCase):
             path.write_text(json.dumps(original), encoding='utf-8')
             cfg = server.Config(str(path))
             rules = cfg.snapshot()['rules']
-            self.assertEqual(len(rules), len(MEMORY_RULES))
+            # schema 10 adds the early commit warning on top of the memory rules.
+            self.assertEqual(len(rules), len(MEMORY_RULES) + 1)
             self.assertEqual(rules[0]['threshold'], 8*GIB)
             self.assertTrue(rules[0]['muted'])
             self.assertEqual(json.loads(Path(str(path)+'.bak').read_text(encoding='utf-8')), original)

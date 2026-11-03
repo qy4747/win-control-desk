@@ -11,6 +11,8 @@ import { configuredPort, actualPorts } from './ports.js';
 const mineList = $('#mineList'), mineEmpty = $('#mineEmpty');
 const bgHeader = $('#bgHeader'), bgBody = $('#bgBody'), bgList = $('#bgList');
 const bgEmpty = $('#bgEmpty'), bgCount = $('#bgCount');
+const sysPanel = $('#sysPanel'), sysHeader = $('#sysHeader'), sysBody = $('#sysBody');
+const sysList = $('#sysList'), sysCount = $('#sysCount');
 const hiddenPanel = $('#hiddenPanel'), hiddenHeader = $('#hiddenHeader');
 const hiddenBody = $('#hiddenBody'), hiddenList = $('#hiddenList'), hiddenCount = $('#hiddenCount');
 const watchChips = $('#watchChips'), watchInput = $('#watchInput');
@@ -601,7 +603,8 @@ function syncMineFilterUI() {
 export function renderServices(d, firstRender) {
   const svcs = d.services || [];
   const mine = svcs.filter(s => s.group === 'mine' && !s.hidden).sort(svcSort);
-  const bg = svcs.filter(s => s.group === 'background' && !s.hidden).sort(svcSort);
+  const bg = svcs.filter(s => s.group === 'background' && !s.hidden && s.layer !== 'system').sort(svcSort);
+  const sys = svcs.filter(s => s.group === 'background' && !s.hidden && s.layer === 'system').sort(svcSort);
   const hid = svcs.filter(s => s.hidden).sort(svcSort);
   const watched = d.watched || [];
   const keywords = d.watchedKeywords || [];
@@ -634,6 +637,7 @@ export function renderServices(d, firstRender) {
 
   reconcile(mineList, mine, serviceKey, () => createServiceRow('mine'), updateServiceRow, firstRender);
   reconcile(bgList, bg, serviceKey, () => createServiceRow('background'), updateServiceRow, firstRender);
+  reconcile(sysList, sys, serviceKey, () => createServiceRow('background'), updateServiceRow, firstRender);
   reconcile(hiddenList, hid, serviceKey, () => createServiceRow('hidden'), updateServiceRow, firstRender);
   reconcile(watchList, watched, w => w.pid, createWatchRow, updateWatchRow, firstRender);
   reconcile(watchChips, keywords, k => k, createChip, () => {}, firstRender);
@@ -642,6 +646,8 @@ export function renderServices(d, firstRender) {
 
   setText($('#mineSecCount'), mine.length ? String(mine.length) : '');
   setText(bgCount, String(bg.length));
+  setText(sysCount, String(sys.length));
+  sysPanel.hidden = sys.length === 0;
   hiddenPanel.hidden = hid.length === 0;
   setText(hiddenCount, '已隐藏 ' + hid.length + ' 个');
 
@@ -660,6 +666,11 @@ bgHeader.addEventListener('click', () => {
   bgBody.hidden = !bgBody.hidden;
   bgHeader.classList.toggle('open', !bgBody.hidden);
   bgHeader.setAttribute('aria-expanded', String(!bgBody.hidden));
+});
+sysHeader.addEventListener('click', () => {
+  sysBody.hidden = !sysBody.hidden;
+  sysHeader.classList.toggle('open', !sysBody.hidden);
+  sysHeader.setAttribute('aria-expanded', String(!sysBody.hidden));
 });
 hiddenHeader.addEventListener('click', () => {
   hiddenBody.hidden = !hiddenBody.hidden;

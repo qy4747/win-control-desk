@@ -296,7 +296,7 @@ function updateAppCard(card, app) {
   r.dot.classList.toggle('running', !!interfaceOpen);
   r.dot.classList.toggle('success', taskSucceeded);
   r.dot.classList.toggle('danger', taskFailed);
-  let stTxt = app.backgroundOnly ? '后台驻留' : app.running ? '运行中' : app.canStart === false ? '观察卡片 · 未配置启动命令' : (app.port ? '已停止' : '未运行');
+  let stTxt = app.backgroundOnly ? '后台驻留' : app.running ? '运行中' : app.canStart === false ? '观察卡片 · 未配置启动命令' : app.stoppedByReboot ? '开机后未启动' : (app.port ? '已停止' : '未运行');
   let stFail = false;
   let taskHistoryText = '';
   if (app.portConflict) {

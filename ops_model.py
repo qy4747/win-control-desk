@@ -18,11 +18,19 @@ MEMORY_RULES = [
          threshold=256*1024**2, recoveryThreshold=192*1024**2, durationSec=120, intervalSec=10, muted=False),
 ]
 PROCESS_MEMORY_METRICS = {'processPrivateBytes', 'processPrivateGrowthBytes'}
+# Early commit warning: leaves time to close or restart the largest consumers
+# before allocations start failing near the commit limit.
+COMMIT_WATCH_RULE = dict(id='system-commit-watch', name='整机提交内存偏高', metric='commitPercent', threshold=75,
+                         recoveryThreshold=70, durationSec=300, intervalSec=10, muted=False)
+# A percentage alone is noisy on multi-terabyte disks; also require little absolute space.
+DISK_FREE_FLOOR_BYTES = 32*1024**3
 
 DEFAULT_RULES = [
     dict(id='system-cpu', name='整机 CPU', metric='cpu', threshold=90, durationSec=60, intervalSec=10, muted=False),
     dict(id='system-memory', name='整机内存', metric='memoryPercent', threshold=90, durationSec=60, intervalSec=10, muted=False),
-    dict(id='disk-free', name='磁盘剩余空间', metric='diskFreePercent', threshold=10, durationSec=60, intervalSec=60, muted=False),
+    dict(id='disk-free', name='磁盘剩余空间', metric='diskFreePercent', threshold=10, minFreeBytes=DISK_FREE_FLOOR_BYTES,
+         durationSec=60, intervalSec=60, muted=False),
+    COMMIT_WATCH_RULE,
 ] + MEMORY_RULES
 APP_FIELDS = dict(category='', actions=[], probe=None, alertPolicy={},
                   externalIdentity=None, expectedRunning=False, startedAt=None,
@@ -247,6 +255,8 @@ def validate_rules(items):
             r.update(dailyTimes=sorted(set(times)), durationSec=0)
         if r['metric'] == 'diskFreePercent':
             r['intervalSec'] = max(60, r['intervalSec'])
+            if item.get('minFreeBytes') is not None:
+                r['minFreeBytes'] = number(item['minFreeBytes'], '最少剩余空间')
         ids.add(r['id'])
         result.append(r)
     return result

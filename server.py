@@ -165,7 +165,7 @@ THEMES_DIR = os.path.join(STATIC_DIR, "themes")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 INSTANCE_LOCK_PATH = os.path.join(DATA_DIR, "console.lock")
 
-CURRENT_SCHEMA_VERSION = 9
+CURRENT_SCHEMA_VERSION = 10
 
 # 默认 UI 主题：新安装与无偏好回退均使用它，主题清单中固定排首位。
 DEFAULT_UI_THEME = "ops"
@@ -517,11 +517,23 @@ def migrate_config_v8_to_v9(raw):
     return raw
 
 
+def migrate_config_v9_to_v10(raw):
+    from ops_model import COMMIT_WATCH_RULE, DISK_FREE_FLOOR_BYTES
+    rules = raw.setdefault('rules', [])
+    for rule in rules:
+        if rule.get('id') == 'disk-free' and rule.get('metric') == 'diskFreePercent':
+            rule.setdefault('minFreeBytes', DISK_FREE_FLOOR_BYTES)
+    if COMMIT_WATCH_RULE['id'] not in {r.get('id') for r in rules}:
+        rules.append(copy.deepcopy(COMMIT_WATCH_RULE))
+    raw['schemaVersion'] = 10
+    return raw
+
+
 CONFIG_MIGRATIONS = {0: migrate_config_v0_to_v1, 1: migrate_config_v1_to_v2,
                      2: migrate_config_v2_to_v3, 3: migrate_config_v3_to_v4,
                      4: migrate_config_v4_to_v5, 5: migrate_config_v5_to_v6,
                      6: migrate_config_v6_to_v7, 7: migrate_config_v7_to_v8,
-                     8: migrate_config_v8_to_v9}
+                     8: migrate_config_v8_to_v9, 9: migrate_config_v9_to_v10}
 
 
 def migrate_config(raw):
@@ -1484,6 +1496,22 @@ def classify_group(key, name, comm, args, cwd, promoted, app=None):
     return "mine"
 
 
+SYSTEM_SERVICE_HOSTS = {'svchost.exe', 'services.exe', 'wininit.exe', 'smss.exe', 'lsass.exe'}
+
+
+def service_layer(comm, app, origin):
+    """'system' for OS components and service-host children; a card always wins."""
+    if app:
+        return 'app'
+    if IS_WIN:
+        if comm.lower().startswith(WIN_SYSTEM_DIR.lower()):
+            return 'system'
+        if ((origin or {}).get('label') or '').lower() in SYSTEM_SERVICE_HOSTS:
+            return 'system'
+        return 'app'
+    return 'system' if comm.startswith(SYSTEM_PATH_PREFIXES) else 'app'
+
+
 HOME_DIR = os.path.expanduser("~")
 
 
@@ -1665,6 +1693,7 @@ def build_services(cfg, groups=None):
         else:
             attach_issue = None
         app = app_by_pid.get(pid)
+        origin = attribute_origin(pid, origin_table)
         services.append({
             "key": key,
             # key 保持 name:port 以兼容既有隐藏/置顶配置；instanceKey 用于
@@ -1678,12 +1707,13 @@ def build_services(cfg, groups=None):
             "attachIssue": attach_issue,
             "cpu": info["cpu"], "mem": info["mem"], "uptimeSec": info["etime"],
             "group": classify_group(key, name, comm, args, cwd, promoted, app),
+            "layer": service_layer(comm, app, origin),
             "pinned": key in pinned, "hidden": key in hidden,
             "promoted": key in promoted,
             "appId": app["id"] if app else None,
             "appName": app["name"] if app else None,
             # 来源溯源（尽力判断）：哪个应用/AI 助手启动了这个进程
-            "origin": attribute_origin(pid, origin_table),
+            "origin": origin,
         })
     return services, listeners
 

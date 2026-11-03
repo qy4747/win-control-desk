@@ -1280,8 +1280,9 @@ body.dragging-on { cursor: grabbing; user-select: none; -webkit-user-select: non
 [data-view="launchpad"] .sec-label { text-transform: none; letter-spacing: 0; }
 .ops-metrics { color: var(--ink-2); font-size: 10px; line-height: 1.2; }
 .ops-metric { --metric-color: var(--accent); border: 0; background: transparent; color: inherit; font: inherit; }
-.ops-metric:nth-child(2) { --metric-color: var(--green, #128363); }
-.ops-metric:nth-child(3) { --metric-color: #9363d7; }
+.ops-metric[data-metric="memoryBytes"] { --metric-color: var(--green, #128363); }
+.ops-metric[data-metric="commitBytes"] { --metric-color: #2f7f9e; }
+.ops-metric[data-metric="gpuMemoryBytes"] { --metric-color: #9363d7; }
 .ops-metric[data-level="warm"] { --metric-color: var(--amber, #ac6700); }
 .ops-metric[data-level="high"] { --metric-color: var(--red); }
 .ops-metric-track { border-radius: 2px; background: linear-gradient(to right, var(--metric-color) var(--progress, 0%), var(--line-2) 0); }

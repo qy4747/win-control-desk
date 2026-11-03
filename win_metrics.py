@@ -1,6 +1,7 @@
 """Read-only Windows telemetry. No PowerShell, third-party packages or service."""
 import ctypes as C
 from ctypes import wintypes as W
+import heapq
 import os
 import re
 import shutil
@@ -9,6 +10,7 @@ import time
 
 # CPU deltas over shorter spans are dominated by scheduling noise.
 CPU_MIN_INTERVAL_SEC = 1.0
+COMMIT_TOP_COUNT = 8
 
 
 class Memory(C.Structure):
@@ -85,6 +87,7 @@ class Metrics:
         self.k.GetProcessTimes.argtypes = [W.HANDLE] + [C.POINTER(C.c_ulonglong)] * 4
         self.k.K32GetProcessMemoryInfo.argtypes = [W.HANDLE, C.POINTER(ProcessMemory), W.DWORD]
         self.k.K32GetPerformanceInfo.argtypes = [C.POINTER(Performance), W.DWORD]
+        self.k.GetTickCount64.restype = C.c_ulonglong
         self.k.GetProcessIoCounters.argtypes = [W.HANDLE, C.POINTER(IO)]
         self.nt.NtQueryInformationProcess.argtypes = [W.HANDLE, W.ULONG, C.c_void_p, W.ULONG, C.POINTER(W.ULONG)]
         self.scm = C.WinDLL('advapi32', use_last_error=True)
@@ -319,6 +322,12 @@ class Metrics:
                            commitPercent=perf.commit/perf.limit*100 if perf_ok and perf.limit else None,
                            processMemoryCoverage=dict(total=len(ppids), readable=sum(
                                r['privateBytes'] is not None for r in table.values())),
+                           commitTop=[dict(pid=pid, name=r['name'], identity=r['identity'],
+                                           privateBytes=r['privateBytes'], workingSetBytes=r['ws'])
+                                      for pid, r in heapq.nlargest(
+                                          COMMIT_TOP_COUNT, ((p, r) for p, r in table.items() if r.get('privateBytes')),
+                                          key=lambda item: item[1]['privateBytes'])],
+                           bootTime=time.time() - self.k.GetTickCount64() / 1000,
                            disks=self.disks,
                            diskWriteBytesPerSec=self.counter('diskWriteBytesPerSec').get('_Total'),
                            gpus=[dict(id=k, dedicatedBytes=dedicated.get(k), sharedBytes=shared.get(k),

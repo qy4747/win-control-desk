@@ -38,6 +38,7 @@ test('alert refresh preserves nested disclosures, summary focus and scroll witho
     directorySnapshots: {} } };
   const context = vm.createContext({ content, document, state, el, alertTarget: 'system',
     button: () => el('button'), pct: n => String(n), bytes: n => String(n),
+    commitAdvice: () => ({ level: 'normal', label: '提交内存正常', lines: [] }),
   });
   const source = readFileSync(new URL('../../static/js/ops.js', import.meta.url), 'utf8');
   vm.runInContext(source.slice(source.indexOf('function section('), source.indexOf('function show('))

@@ -30,6 +30,21 @@ def snapshot_slot(now, times):
                   datetime.time.fromisoformat(t)).timestamp() <= now)
 
 
+def commit_detail(system, app_names=None):
+    """Name the largest private-commit holders so a commit alert says what to close."""
+    top = [p for p in (system or {}).get('commitTop') or [] if p.get('privateBytes')][:3]
+    if not top:
+        return None
+    names = app_names or {}
+    parts = [f"{names.get(p['pid']) or p.get('name') or 'PID ' + str(p['pid'])} {p['privateBytes']/1024**3:.1f} GiB"
+             for p in top]
+    text = '占用最多：' + '、'.join(parts) + '。先保存工作，再关闭或重启这些程序'
+    boot = (system or {}).get('bootTime')
+    if boot and time.time() - boot >= 3*86400:
+        text += f"；系统已连续运行 {int((time.time() - boot)//86400)} 天，重启可完整回收"
+    return text + '。'
+
+
 def snapshot_delta(history, window):
     if not history:
         return None
@@ -519,7 +534,7 @@ class Monitor:
                 after = latest.get(app['id'], {})
                 app['lifecycleChanging'] = app['id'] in stopping or any(
                     before.get(key) != after.get(key) for key in lifecycle_fields)
-            self.check_apps(data['apps'], now, valid)
+            self.check_apps(data['apps'], now, valid, system.get('bootTime'))
             native = self.api._NATIVE_METRICS if self.api.IS_WIN else None
             self.check_system(system, cfg.get('rules', []), now,
                               table if native else None, native.seen_pids if native else None,
@@ -536,7 +551,7 @@ class Monitor:
             self.state = data
         self.initial = False
 
-    def check_apps(self, apps, now, valid):
+    def check_apps(self, apps, now, valid, boot_time=None):
         ids = {a['id'] for a in apps}
         for mapping in (self.alerts.states, self.alerts.overrides):
             for key in list(mapping):
@@ -564,7 +579,11 @@ class Monitor:
                 self.exit_baseline[ident] = signature
             failed_exit = exit_info.get('code') not in (None, 0, 130) and exit_info.get('status') != 'stopped'
             expected = app.get('expectedRunning') and (exit_policy == 'always' or (exit_policy == 'default' and kind == 'service'))
-            bad = not app['running'] and (bool(expected) or (exit_policy != 'never' and failed_exit))
+            # Windows restarts end every managed app; an app last started before
+            # this boot did not crash, it simply has not been started again yet.
+            before_boot = bool(boot_time and not app['running'] and (app.get('startedAt') or 0) < boot_time - 60)
+            app['stoppedByReboot'] = before_boot and bool(app.get('expectedRunning'))
+            bad = not app['running'] and not before_boot and (bool(expected) or (exit_policy != 'never' and failed_exit))
             check('exit', bad, '意外退出' if bad else '运行状态正常', '运行异常', silent=first)
             grace = time.time()-(app.get('startedAt') or 0) < policy.get('graceSec', 30)
             probe = self.probes.get(ident)
@@ -729,8 +748,12 @@ class Monitor:
                 self.check_process_memory(r, processes, seen_pids, now, system, app_names)
                 continue
             values = {'system': system.get(metric)}
+            detail = None
             if metric == 'diskFreePercent':
                 values = {d['path']: d['freePercent'] for d in system.get('disks', [])}
+                free_bytes = {d['path']: d.get('freeBytes') for d in system.get('disks', [])}
+            elif metric == 'commitPercent':
+                detail = commit_detail(system, app_names)
             elif metric == SNAPSHOT_METRIC:
                 delta = snapshot_delta(record.get('history', []), r['windowSec']) if record.get('status') == 'ok' else None
                 values = {r['path']: delta['bytes'] if delta else None}
@@ -753,7 +776,13 @@ class Monitor:
                 active = self.alerts.states.get(key, {}).get('active')
                 threshold = r.get('recoveryThreshold', r['threshold']) if active else r['threshold']
                 bad = None if value is None else value < threshold if metric == 'diskFreePercent' else value > threshold
-                self.alerts.check(key, bad, value, dict(r, name=r['name']+' · '+target), now)
+                floor = r.get('minFreeBytes') if metric == 'diskFreePercent' else None
+                if bad and floor is not None and free_bytes.get(target) is not None:
+                    bad = free_bytes[target] < floor
+                rule = dict(r, name=r['name']+' · '+target)
+                if detail:
+                    rule['detail'] = detail
+                self.alerts.check(key, bad, value, rule, now)
 
     def discover(self, all_processes=False):
         if not self.api.IS_WIN:
