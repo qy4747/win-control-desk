@@ -12,7 +12,7 @@ import time
 import uuid
 
 from ops_model import http_action, number, script_command, preset_steps, PROCESS_MEMORY_METRICS
-from ops_entries import refresh_instance, browser_card_rule, desktop_rule_upgrade_needed
+from ops_entries import refresh_instance, browser_card_rule, desktop_rule_upgrade_needed, same_window_executable
 from win_notify import Notifier
 
 LOG = logging.getLogger('console')
@@ -43,6 +43,35 @@ def commit_detail(system, app_names=None):
     if boot and time.time() - boot >= 3*86400:
         text += f"；系统已连续运行 {int((time.time() - boot)//86400)} 天，重启可完整回收"
     return text + '。'
+
+
+# Interpreters, terminals and browsers host many unrelated programs and web
+# apps; their exe says nothing about which card a process might belong to.
+SHARED_HOST_EXES = {'python.exe', 'pythonw.exe', 'node.exe', 'cmd.exe', 'powershell.exe', 'pwsh.exe',
+                    'windowsterminal.exe', 'wt.exe', 'wsl.exe', 'bash.exe', 'conhost.exe', 'openconsole.exe',
+                    'msedge.exe', 'chrome.exe', 'firefox.exe', 'brave.exe', 'vivaldi.exe', 'opera.exe',
+                    'explorer.exe', 'applicationframehost.exe'}
+
+
+def card_executables(app, parse=None):
+    """Executables a saved card is known to run, for hinting unassociated matches only."""
+    exes = [(app.get('externalIdentity') or {}).get('exe'), (app.get('instanceMatch') or {}).get('exe'),
+            (app.get('windowBinding') or {}).get('exe'), ((app.get('windowBinding') or {}).get('match') or {}).get('exe')]
+    tokens = parse(app.get('command') or '') if parse else None
+    if tokens and tokens[0].lower().endswith('.exe') and os.path.isabs(tokens[0]):
+        exes.append(tokens[0])
+    return {e for e in exes if e and os.path.basename(e).lower() not in SHARED_HOST_EXES}
+
+
+def discovery_card(pid, exe, owners, cards):
+    """managed: the card already controls this PID; similar: a card runs the same exe but is not associated."""
+    if pid in owners:
+        return dict(owners[pid], state='managed')
+    if exe and os.path.basename(exe).lower() not in SHARED_HOST_EXES:
+        for card, exes in cards:
+            if any(same_window_executable(exe, known) for known in exes):
+                return dict(card, state='similar')
+    return None
 
 
 def snapshot_delta(history, window):
@@ -790,19 +819,28 @@ class Monitor:
         from win_metrics import windows
         table = self.api._win_process_table()
         visible = windows()
-        services = self.snapshot().get('services', [])
+        state = self.snapshot()
         ports = {}
-        for s in services:
+        for s in state.get('services', []):
             ports.setdefault(s['pid'], []).append(s['port'])
+        owners = {pid: dict(id=a['id'], name=a['name']) for a in state.get('apps', []) for pid in a.get('pids', [])}
+        running = {a['id'] for a in state.get('apps', []) if a.get('running')}
+        parse = getattr(self.api, '_simple_command_tokens', None)
+        cards = [(dict(id=a['id'], name=a['name']), card_executables(a, parse))
+                 for a in self.cfg.snapshot().get('apps', []) if a['id'] not in running]
+        system_dir = (getattr(self.api, 'WIN_SYSTEM_DIR', '') or '').lower()
         rows = []
         for pid, p in table.items():
             if pid == self.api.SELF_PID or (not all_processes and pid not in visible and pid not in ports):
+                continue
+            if not all_processes and system_dir and (p['exe'] or '').lower().startswith(system_dir):
                 continue
             if self.api.process_uid(pid) != self.api.SELF_UID:
                 continue
             rows.append(dict(pid=pid, created=p['identity'], exe=p['exe'], command=p['args'],
                              name=visible.get(pid, [(None, p['name'])])[0][1], ports=ports.get(pid, []),
-                             kind='desktop' if pid in visible else 'service'))
+                             kind='desktop' if pid in visible else 'service',
+                             card=discovery_card(pid, p['exe'], owners, cards)))
         return rows
 
     def execute_action(self, app, action_id):

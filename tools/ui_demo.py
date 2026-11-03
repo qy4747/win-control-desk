@@ -266,8 +266,15 @@ class Demo:
         elif path == '/api/ops/force':
             return self.operate(self.app(body['appId']), 'stop')
         elif path == '/api/ops/discover':
-            return dict(items=[dict(pid=24001, created=12345, name='演示画图工具', exe='C:\\Demo\\paint.exe', command='paint.exe', ports=[], kind='desktop'),
-                               dict(pid=24002, created=12346, name='演示 Web 服务', exe='C:\\Demo\\python.exe', command='python demo.py', ports=[8899], kind='service')])
+            first = self.data['apps'][0] if self.data.get('apps') else None
+            items = [dict(pid=24001, created=12345, name='演示画图工具', exe='C:\\Demo\\paint.exe', command='paint.exe', ports=[], kind='desktop', card=None),
+                     dict(pid=24002, created=12346, name='演示 Web 服务', exe='C:\\Demo\\python.exe', command='python demo.py', ports=[8899], kind='service', card=None)]
+            if first:
+                items += [dict(pid=24003, created=12347, name=first['name'], exe='C:\\Demo\\managed.exe', command='managed.exe', ports=[], kind='desktop',
+                               card=dict(id=first['id'], name=first['name'], state='managed')),
+                          dict(pid=24004, created=12348, name='演示音乐（第二实例）', exe='C:\\Demo\\music.exe', command='music.exe', ports=[], kind='desktop',
+                               card=dict(id=first['id'], name=first['name'], state='similar'))]
+            return dict(items=items)
         elif path in ('/api/apps', '/api/ops/discover/import'):
             validate_app_extra(body)
             values = {k: v for k, v in body.items() if k not in ('name', 'id', 'category', 'appId')}

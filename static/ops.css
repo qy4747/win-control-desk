@@ -59,6 +59,11 @@
 .ops-discovery-row { display: flex; align-items: center; gap: 10px; padding: 12px 0; }
 .ops-discovery-row > div, .ops-discovery-row > strong { min-width: 0; flex: 1; overflow-wrap: anywhere; }
 .ops-discovery-row > button { flex-shrink: 0; }
+.ops-discovery-row > input[type="checkbox"] { width: 18px; height: 18px; flex-shrink: 0; }
+.ops-discovery-tag { display: inline-block; margin-left: 8px; padding: 1px 8px; vertical-align: 1px; }
+.ops-discovery-bar { position: sticky; top: -22px; z-index: 1; display: flex; align-items: center; gap: 12px; margin: 8px 0 4px; padding: 10px 0; }
+.ops-discovery-bar > .hint { flex: 1; margin: 0; }
+.ops-discovery-bar > .btn { flex-shrink: 0; }
 .ops-run { margin: 16px 0; padding: 12px; }
 .ops-card-alert[hidden], .ops-panel [hidden] { display: none; }
 @media (max-width: 600px) {

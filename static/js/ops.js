@@ -5,6 +5,7 @@ import { preferredOpenPort, portIsOpenable } from './ports.js';
 import { topResources } from './resources.js';
 import { commitAdvice, commitTopRows } from './memory-advice.js';
 import { scenePlan } from './scene-plan.js';
+import { aiHandoff, discoveryCounts, discoveryRows, quickAddPayload, rowKey } from './discovery-model.js';
 import { packageState, bindPackagePress } from './packages.js';
 import { bindPresetHover, renderPresetHover } from './preset-hover.js';
 import { initTagDrawer } from './tag-drawer.js';
@@ -619,29 +620,77 @@ function renderDetail() {
 async function openDiscovery(existingId = null) {
   if (!show(existingId ? '选择要关联的运行实例' : '从当前运行中发现')) return;
   const search = field(content, '搜索名称、路径或 PID');
+  const unadded = field(content, '只显示未添加的', true, 'checkbox');
   const all = field(content, '包括隐藏后台进程（无窗口、无端口）', false, 'checkbox');
+  const summary = note(content, '');
   const results = el('div', 'ops-discovery'); content.append(results);
+  const picked = new Map();
+  const bar = el('div', 'ops-discovery-bar');
+  const handoff = button('', () => copyHandoff([...picked.values()]), 'btn btn-accent');
+  if (!existingId) {
+    note(bar, '勾选后复制给 AI：生成包含程序身份和 manage_apps.py 步骤的说明，由 AI 补全按钮、脚本和批处理流，预演确认后再写入。');
+    bar.append(handoff); results.before(bar);
+  }
+  const syncBar = () => { handoff.textContent = '复制给 AI（' + picked.size + '）'; handoff.disabled = !picked.size; };
   let items = [];
   const render = () => {
     results.replaceChildren();
-    const query = search.value.toLowerCase();
-    for (const row of items.filter(r => (r.name + ' ' + r.exe + ' ' + r.pid + ' ' + r.command).toLowerCase().includes(query))) {
-      const item = el('div', 'ops-discovery-row');
+    const counts = discoveryCounts(items);
+    setText(summary, '未添加 ' + counts.unadded + ' 个 · 可能对应未关联卡片 ' + counts.similar + ' 个 · 已有卡片 ' + counts.managed + ' 个');
+    for (const row of discoveryRows(items, search.value, unadded.checked)) {
+      const item = el('div', 'ops-discovery-row'); item.dataset.state = row.card?.state || 'unadded';
+      if (!existingId && row.card?.state !== 'managed') {
+        const pick = el('input'); pick.type = 'checkbox'; pick.checked = picked.has(rowKey(row));
+        pick.setAttribute('aria-label', '选择 ' + row.name + ' 复制给 AI');
+        pick.addEventListener('change', () => { if (pick.checked) picked.set(rowKey(row), row); else picked.delete(rowKey(row)); syncBar(); });
+        item.append(pick);
+      }
       const desc = el('div'); const name = el('strong'); name.textContent = row.name; desc.append(name);
+      if (row.card) {
+        const tag = el('span', 'ops-discovery-tag');
+        tag.textContent = row.card.state === 'managed' ? '已有卡片：' + row.card.name : '可能是「' + row.card.name + '」，未关联';
+        desc.append(tag);
+      }
       note(desc, 'PID ' + row.pid + ' · ' + (row.ports.map(p => ':' + p).join(' ') || '无监听端口') + '\n' + row.exe);
-      item.append(desc, button(existingId ? '关联' : '加入卡片', () => importEditor(row, existingId))); results.append(item);
+      item.append(desc);
+      if (existingId) item.append(button('关联', () => importEditor(row, existingId)));
+      else if (row.card?.state === 'managed') item.append(button('查看卡片', () => openDetails(row.card.id)));
+      else {
+        if (row.card?.state === 'similar') item.append(button('关联到此卡片', () => importEditor(row, row.card.id)));
+        item.append(button('快速加入', () => quickAdd(row), 'btn btn-accent'), button('自定义加入', () => importEditor(row, null)));
+      }
+      results.append(item);
     }
-    if (!results.children.length) note(results, '没有匹配的运行对象');
+    if (!results.children.length) note(results, unadded.checked && items.length ? '当前运行对象都已有卡片' : '没有匹配的运行对象');
   };
   async function load() {
     const response = await fetch('/api/ops/discover' + (all.checked ? '?all=1' : ''));
     const data = await response.json(); if (!response.ok) throw new Error(data.error || '发现失败');
-    items = data.items; render();
+    items = data.items;
+    const live = new Set(items.map(rowKey));
+    for (const key of [...picked.keys()]) if (!live.has(key)) picked.delete(key);
+    syncBar(); render();
   }
-  search.addEventListener('input', render); all.addEventListener('change', () => load().catch(e => toast(e.message)));
-  note(results, '正在读取当前运行对象…'); await load();
+  async function quickAdd(row) {
+    const result = await act(post('/api/ops/discover/import', quickAddPayload(row)));
+    if (result && result.ok !== false) {
+      toast(quickAddPayload(row).command ? '已加入：' + row.name : '已加入观察卡片：' + row.name + '（解释器程序需补启动命令）');
+      picked.delete(rowKey(row)); window.__poll(); await load();
+    }
+  }
+  search.addEventListener('input', render); unadded.addEventListener('change', render);
+  all.addEventListener('change', () => load().catch(e => toast(e.message)));
+  syncBar(); note(results, '正在读取当前运行对象…'); await load();
 }
-function importEditor(row, existingId) {
+async function copyHandoff(rows) {
+  if (!rows.length) return;
+  const text = aiHandoff(rows, { cwd: state.data?.consoleCwd, port: state.data?.consolePort });
+  try { await navigator.clipboard.writeText(text); toast('已复制 ' + rows.length + ' 项给 AI，补充定制需求后发送'); return; }
+  catch { /* Clipboard can be denied without a user gesture or permission; show the text instead. */ }
+  if (!show('复制给 AI')) return;
+  note(content, '无法写入剪贴板，请手动全选复制：');
+  const box = field(content, 'AI 说明', text, 'textarea'); box.rows = 18; box.readOnly = true; box.focus(); box.select();
+}function importEditor(row, existingId) {
   if (!show('加入：' + row.name)) return;
   note(content, '发现命令：' + (row.command || '无法读取') + '\n程序：' + row.exe + '\n未填写启动命令时保存为观察卡片。');
   const existing = state.data.apps.find(a => a.id === existingId);
