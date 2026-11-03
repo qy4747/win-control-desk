@@ -593,6 +593,50 @@
 .tips-ic { display: inline-flex; }
 .tips-action { margin-top: 10px; }
 
+/* Glance, log summary and shortcut help: geometry only. */
+.glance-main { padding: 0 16px 20px; }
+.glance-head { position: sticky; top: 0; z-index: 1; padding: 14px 0 10px; }
+.glance-heading, .glance-search { display: flex; align-items: center; gap: 8px; }
+.glance-heading { justify-content: space-between; margin-bottom: 9px; }
+.glance-heading h1 { margin: 0; }
+.glance-search { padding: 0 10px; }
+.glance-search input { min-width: 0; flex: 1; height: 32px; }
+.glance-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 9px; }
+.glance-legend span { display: inline-flex; align-items: center; gap: 4px; }
+.glance-legend span::before { content: ''; width: 7px; height: 7px; }
+#glanceGroups { display: flex; flex-wrap: wrap; align-items: flex-start; column-gap: 8px; }
+.glance-section { margin-top: 12px; width: min(100%, calc(var(--group-columns) * 80px - 4px)); }
+.glance-section h2 { display: flex; align-items: baseline; gap: 8px; margin: 0 0 5px; }
+.glance-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 76px), 1fr)); gap: 4px; }
+.glance-tile { display: grid; justify-items: center; gap: 4px; min-width: 0; padding: 4px 2px; }
+.glance-face, .glance-art { display: grid; place-items: center; }
+.glance-face { position: relative; width: 48px; height: 48px; }
+.glance-art { width: 100%; height: 100%; overflow: hidden; border-radius: inherit; }
+.glance-art img { width: 100%; height: 100%; object-fit: contain; }
+.glance-face i { position: absolute; right: -2px; bottom: -1px; width: 11px; height: 11px; }
+.glance-name { max-width: 100%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.glance-menu { position: fixed; z-index: 3; display: grid; padding: 4px; min-width: 150px; }
+.glance-menu[hidden] { display: none; }
+.glance-menu button { padding: 6px 10px; text-align: start; }
+.log-summary-head, .shortcut-help header { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.log-summary-head select { padding: 5px 8px; }
+.log-scroll { overflow-x: auto; }
+.log-overview { width: 100%; border-collapse: collapse; }
+.log-overview :is(td, th) { padding: 9px 10px; text-align: end; white-space: nowrap; }
+.log-overview :is(th, td):first-child { text-align: start; }
+.log-tools { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 10px 14px 0; }
+.log-tools input[type="search"] { flex: 1; min-width: 120px; padding: 6px 8px; }
+.shortcut-help header h2, .shortcut-help dl, .shortcut-help dd { margin: 0; }
+.shortcut-help dl { display: grid; grid-template-columns: auto 1fr; align-items: baseline; gap: 7px 12px; }
+.shortcut-help dd { text-align: end; }
+.shortcut-help details dd { text-align: start; }
+.shortcut-help h3 { margin: 18px 0 8px; }
+.shortcut-nav { display: grid; grid-template-columns: repeat(2, 1fr); gap: 7px 18px; list-style: none; margin: 0; padding: 0; }
+.shortcut-nav li { display: flex; justify-content: space-between; gap: 5px; }
+.shortcut-help details { margin-top: 16px; }
+.shortcut-help details dl { margin-top: 8px; }
+.shortcut-help summary, .log-overview tbody tr { cursor: pointer; }
+
 /* ---------- KPI 卡（图标 + 数值 + 副标签 + 火花线） ---------- */
 .ov { display: flex; align-items: flex-start; gap: 12px; }
 .ov-body { flex: 1; min-width: 0; }

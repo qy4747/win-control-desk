@@ -4600,6 +4600,10 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/console/log":
                 self.handle_console_log(parsed.query)
                 return
+            if path == "/api/logs/summary":
+                from log_center import log_center
+                self.send_json(log_center.summary(LOGS_DIR, self.server.cfg.snapshot()["apps"]))
+                return
             m = APP_ROUTE_RE.match(path)
             if m and m.group(2) == "logs":
                 self.handle_logs(m.group(1), parsed.query)
@@ -4610,6 +4614,8 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/icons/"):
                 self.serve_icon(path)
                 return
+            if path in ("/glance", "/glance.html"):
+                return serve_glance(self)
             self.serve_static(path)
         except (BrokenPipeError, ConnectionResetError,
                 ConnectionAbortedError):
@@ -5828,6 +5834,23 @@ def redirect_console_output():
             stream.reconfigure(line_buffering=True)
         except (AttributeError, OSError):
             pass
+
+
+def serve_glance(handler):
+    """Standalone control page: apply its theme before paint and issue a session."""
+    from pathlib import Path
+    root = Path(STATIC_DIR).resolve()
+    page = (root / "glance.html").resolve()
+    if not page.is_relative_to(root) or not page.is_file():
+        return handler._send(b"404 Not Found", 404, set_cookie=False)
+    selected = handler.server.cfg.snapshot().get("uiTheme", DEFAULT_UI_THEME)
+    theme = next((t for t in list_themes() if t["id"] == selected), {"id": DEFAULT_UI_THEME})
+    css = theme.get("css", "/themes/" + theme["id"] + ".css")
+    html = page.read_bytes().replace(b'data-ui-theme="ops"',
+                                     ('data-ui-theme="' + theme["id"] + '"').encode(), 1)
+    html = html.replace(b'href="/themes/ops.css" id="themeCss"',
+                        ('href="' + css + '" id="themeCss"').encode(), 1)
+    handler._send(html, 200, "text/html; charset=utf-8", set_cookie=True)
 
 
 def main(preferred_port=None, open_browser=True, log_to_file=False):

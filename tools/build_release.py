@@ -49,6 +49,7 @@ INCLUDE = (
     "ops_api.py",
     "ops_entries.py",
     "service_web.py",
+    "log_center.py",
     "file_tools.py",
     "win_metrics.py",
     "win_notify.py",

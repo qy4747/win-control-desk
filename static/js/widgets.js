@@ -3,14 +3,16 @@
    widgets.js — 右侧信息栏与导航轨
    实时动态/实时告警（会话内状态差异事件流，首帧静默建立基线）、
    端口/资源 TOP 5、小贴士、快捷操作、导航轨连接状态与版本。
-   全部数据来自 /api/state 轮询快照，不新增后端接口。
+   右栏使用状态快照；日志目录仅在日志中心可见时单独读取。
    ============================================================ */
-import { $, el, setText, setChildren, icon, state, fmtClock, taskExitStatus,
+import { $, el, setText, setChildren, icon, state, fmtClock, taskExitStatus, reconcile,
   act, post, toast, escapeHtml, applyTheme,
   taskNotificationsEnabled, toggleTaskNotifications } from './core.js';
 import { openAppModal, openLogs, openConsoleLog, openConfirm } from './overlays.js';
 import { configuredPort } from './ports.js';
 import { topResources } from './resources.js';
+import { viewPoll } from './view-poll.js';
+import { sortedLogs, formatBytes, growthTone } from './log-model.js';
 
 const FEED_CAP = 50;
 let feedSeq = 0;
@@ -58,7 +60,8 @@ export function initWidgets(switchView) {
   });
   setChildren($('#railIconLogs'), icon('file-text', 19));
   setChildren($('#railIconSettings'), icon('settings', 19));
-  $('#consoleLogOpen').addEventListener('click', openConsoleLog);
+  $('#logsSort').addEventListener('change', renderLogsList);
+  document.addEventListener('visibilitychange', syncLogPoll);
   $('#setNotify').addEventListener('click', () => {
     toggleTaskNotifications();
     syncSettings();
@@ -322,7 +325,7 @@ export function renderWidgets(data) {
   renderTopRes(data);
   renderTips(data);
   setText(railVer, data.version ? 'v' + data.version : 'v—');
-  refreshCenterPages();
+  refreshCenterPages(false);
 }
 
 /* ============================================================
@@ -330,57 +333,38 @@ export function renderWidgets(data) {
    ============================================================ */
 const logsList = $('#logsList');
 
-function logsRow(app) {
-  const row = el('button', 'logs-item');
-  row.dataset.appId = app.id;
-  row.type = 'button';
-  const box = el('span', 'logs-ic');
-  if (app.icon) {
-    const img = new Image();
-    img.src = app.icon;
-    img.alt = '';
-    box.appendChild(img);
-  } else if (app.glyph && window.LUCIDE && window.LUCIDE[app.glyph]) {
-    box.appendChild(icon(app.glyph, 14));
-  } else {
-    box.textContent = app.name ? [...app.name][0].toUpperCase() : '?';
-  }
-  const main = el('span', 'logs-main');
-  const name = el('span', 'logs-name');
-  name.textContent = app.name || '未命名';
-  const sub = el('span', 'logs-sub');
-  const isTask = (app.kind || 'service') === 'task';
-  const port = configuredPort(app);
-  sub.textContent = (app.running ? '运行中' : '已停止') +
-    (isTask ? ' · 任务' : port ? ' · :' + port : '');
-  main.append(name, sub);
-  row.append(box, main, icon('chevron-right', 14));
-  row.addEventListener('click', () => {
-    const current = state.data?.apps?.find(a => a.id === app.id);
-    if (current) openLogs(current);
-  });
-  return row;
-}
-
+let logSummary;
+const dateFormat = new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
 function renderLogsList() {
-  const apps = (state.data && state.data.apps) || [];
-  const rows = new Map([...logsList.querySelectorAll('.logs-item')].map(row => [row.dataset.appId, row]));
-  for (const row of rows.values()) if (!apps.some(a => a.id === row.dataset.appId)) row.remove();
-  if (apps.length) logsList.querySelector('.logs-empty')?.remove();
-  for (const [index, app] of apps.entries()) {
-    const row = rows.get(app.id) || logsRow(app);
-    setText(row.querySelector('.logs-name'), app.name || '未命名');
-    const port = configuredPort(app);
-    setText(row.querySelector('.logs-sub'), (app.running ? '运行中' : '已停止') +
-      (app.kind === 'task' ? ' · 任务' : port ? ' · :' + port : ''));
-    if (logsList.children[index] !== row) logsList.insertBefore(row, logsList.children[index] || null);
-  }
-  if (!apps.length && !logsList.querySelector('.logs-empty')) {
-    const empty = el('div', 'logs-empty');
-    empty.textContent = '暂无应用，添加卡片后可在这里查看日志。';
-    logsList.prepend(empty);
-  }
+  if (!logSummary) return;
+  setText($('#logsTotal'), formatBytes(logSummary.totalBytes));
+  const sorted = sortedLogs(logSummary, $('#logsSort').value);
+  reconcile(logsList, sorted, r => r.appId, item => {
+    const row = el('tr'), name = el('button', 'log-source'); name.type = 'button';
+    const first = el('th'); first.scope = 'row'; first.append(name); row.append(first);
+    for (let i = 1; i < 7; i++) row.append(el('td'));
+    row.addEventListener('click', () => {
+      const entry = item.appId === 'console' ? logSummary.console : logSummary.apps.find(a => a.appId === item.appId);
+      if (entry?.appId === 'console') openConsoleLog();
+      else if (entry) openLogs({ id: entry.appId, name: entry.name });
+    });
+    return row;
+  }, (row, item) => {
+    const [source, size, backups, growth, modified, errors, nul] = row.children;
+    setText(source.firstChild, item.name); source.title = item.lastLine;
+    setText(size, formatBytes(item.bytes)); setText(backups, formatBytes(item.backupBytes));
+    setText(growth, formatBytes(item.growthBytesPerHour)); growth.dataset.tone = growthTone(item.growthBytesPerHour);
+    growth.title = item.growthBytesPerHour == null ? '等待至少 60 秒的两次采样' : '';
+    setText(modified, item.mtime == null ? '—' : dateFormat.format(item.mtime * 1000));
+    setText(errors, String(item.errorCount)); errors.dataset.tone = item.errorCount ? 'warn' : '';
+    setText(nul, item.nulDetected ? '检测到' : '—'); nul.dataset.tone = item.nulDetected ? 'danger' : '';
+  });
 }
+const logPoll = viewPoll({ url: '/api/logs/summary', interval: 30000, timeout: 10000,
+  onData(data) { logSummary = data; renderLogsList(); $('#logsNotice').hidden = true; },
+  onError() { setText($('#logsNotice'), '日志摘要读取失败，将在 30 秒后重试。'); $('#logsNotice').hidden = false; },
+});
+function syncLogPoll() { logPoll.setActive(state.view === 'logs' && !document.hidden); }
 
 export function openLogsCenter() { navigate('logs'); }
 
@@ -404,8 +388,8 @@ function syncSettings() {
   setText($('#setDataDir'), d.dataDir || '—');
 }
 
-export function refreshCenterPages() {
-  if (state.view === 'logs') renderLogsList();
+export function refreshCenterPages(viewChanged = true) {
+  if (viewChanged) syncLogPoll();
   if (state.view === 'settings') syncSettings();
 }
 export function openSettingsCenter() { navigate('settings'); }

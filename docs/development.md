@@ -31,6 +31,7 @@
 | `/api/console/stop`、`/api/console/restart`、`/api/ui/theme` | 控制台与主题；`server.py` |
 | `/api/ops/*` | 运行实例发现/导入、动作、窗口、规则、场景、事件和告警；`ops_api.py` 的 `get/post` |
 | `/api/files/*` | 文件夹、搜索和 QuickLook 预览；`file_tools.py` |
+| `GET /api/logs/summary`、`GET /glance` | 日志占用一览（15 秒缓存，只读各文件尾部 64 KiB）与图标总览窗口；`log_center.py`、`server.py` |
 
 写接口沿用现有请求授权和每应用操作锁。新增不读取 JSON 的 POST 路由也需消费请求体，避免残留字节污染 keep-alive 后续请求。
 
@@ -47,7 +48,7 @@
 
 ## 配置
 
-当前 `schemaVersion` 为 **9**；定义见 `server.py` 的 `CURRENT_SCHEMA_VERSION`，完整默认值见 `Config.DEFAULT`、`Config.APP_DEFAULT` 与 `ops_model.APP_FIELDS`。
+当前 `schemaVersion` 为 **10**；定义见 `server.py` 的 `CURRENT_SCHEMA_VERSION`，完整默认值见 `Config.DEFAULT`、`Config.APP_DEFAULT` 与 `ops_model.APP_FIELDS`。
 
 顶层保存卡片与服务标记、主题、规则/场景、告警忽略与覆盖、文件夹/搜索设置及目录快照。运行身份由后端生成；窗口绑定和实例规则通过专用 API 保存。
 

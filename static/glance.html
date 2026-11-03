@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light" data-ui-theme="ops">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<script src="/js/theme-startup.js"></script>
+<title>图标总览 · 总控台</title>
+<link rel="icon" href="/assets/favicon-32.png">
+<link rel="stylesheet" href="/themes/ops.css" id="themeCss">
+<link rel="stylesheet" href="/base.css">
+</head>
+<body class="glance-page">
+<main class="glance-main">
+  <header class="glance-head">
+    <div class="glance-heading"><h1>图标总览</h1><span class="mono" id="glanceCount"></span></div>
+    <label class="glance-search"><span id="searchIcon" aria-hidden="true"></span><input type="search" id="glanceSearch" aria-label="筛选应用" placeholder="搜索应用或分类" autocomplete="off"><kbd>/</kbd></label>
+    <div class="glance-legend" aria-label="状态图例"><span data-status="running">运行中</span><span data-status="stopped">停止</span><span data-status="error">异常</span><span data-status="task">任务中</span><span data-status="unknown">待确认</span></div>
+  </header>
+  <p id="glanceConnection" role="status">正在连接总控台…</p>
+  <div id="glanceGroups"></div>
+  <p id="glanceEmpty" hidden></p>
+</main>
+<div id="glanceMenu" class="glance-menu" role="menu" aria-label="应用操作" hidden>
+  <button type="button" role="menuitem" data-action="open">打开</button>
+  <button type="button" role="menuitem" data-action="stop">停止</button>
+  <button type="button" role="menuitem" data-action="restart">重启</button>
+  <button type="button" role="menuitem" data-action="log">日志</button>
+  <button type="button" role="menuitem" data-action="show">在总控台中显示</button>
+</div>
+<div class="toast" id="toast" role="status"></div>
+<script src="/icons.js" defer></script>
+<script type="module" src="/js/glance.js"></script>
+</body></html>

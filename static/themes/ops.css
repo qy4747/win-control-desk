@@ -1482,3 +1482,44 @@ body.dragging-on { cursor: grabbing; user-select: none; -webkit-user-select: non
 @media (max-width: 700px) {
   :is([data-view="folders"], [data-view="files"]) .view-head h2 { font-size: 28px; }
   .file-search-input input { font-size: 13px; }}
+
+/* Shared semantic colors follow each pack and its light/dark palette. */
+.glance-head { background: var(--room); border-bottom: 1px solid var(--line); }
+.glance-heading h1, .shortcut-help header h2 { font-size: 21px; letter-spacing: -.03em; }
+.glance-heading span, .glance-section small { color: var(--ink-3); font-size: 11px; }
+.glance-search, .log-tools input[type="search"], .log-summary-head select {
+  color: var(--ink); background: var(--card); border: 1px solid var(--line-2); border-radius: 8px; }
+.glance-search { color: var(--ink-3); }
+.glance-search:focus-within { box-shadow: var(--focus-ring); }
+.glance-search input { font: inherit; background: transparent; color: var(--ink); border: 0; outline: 0; }
+.glance-section h2, .shortcut-help h3 { font-size: 13px; color: var(--ink-2); }
+.glance-tile { background: transparent; border: 0; border-radius: 8px; color: var(--ink); }
+.glance-legend { color: var(--ink-3); font-size: 11px; }
+.glance-legend span::before { background: var(--status-color); border-radius: 50%; }
+.glance-page [data-status="stopped"] { --status-color: var(--ink-4); }
+.glance-page [data-status="running"] { --status-color: var(--green); }
+.glance-page [data-status="error"] { --status-color: var(--red); }
+.glance-page [data-status="task"] { --status-color: var(--purple); }
+.glance-page [data-status="unknown"] { --status-color: var(--amber); }
+.glance-tile:hover, .glance-menu button:is(:hover,:focus-visible):enabled { background: var(--card-2); }
+.glance-face { border: 1px solid color-mix(in srgb, var(--status-color) 60%, var(--line)); border-radius: 12px;
+  color: var(--accent-ink); background: var(--card); box-shadow: var(--shadow); font-size: 23px; font-weight: 650; }
+.glance-face i { background: var(--status-color); border: 2px solid var(--room); border-radius: 50%; }
+.glance-name { font-size: 12px; }
+.glance-menu { background: var(--card); border: 1px solid var(--line-2); border-radius: 10px; box-shadow: var(--shadow-lg); }
+.glance-menu button { background: transparent; border: 0; color: var(--ink); border-radius: 6px; font: inherit; }
+.glance-menu button:disabled { color: var(--ink-3); opacity: .6; }
+#glanceConnection, #logsNotice { color: var(--amber); }
+.glance-page kbd, .shortcut-help kbd { background: var(--card-2); border: 1px solid var(--line); border-radius: 4px;
+  padding: 1px 5px; font: 12px var(--font-mono); color: var(--ink-2); }
+.log-total { font-size: 28px; color: var(--ink); font-variant-numeric: tabular-nums; }
+.log-overview { font-size: 13px; font-variant-numeric: tabular-nums; }
+.log-overview th, .log-overview td { border-bottom: 1px solid var(--line); }
+.log-overview thead { background: var(--card-2); color: var(--ink-2); }
+.log-overview tbody tr:is(:hover,:focus-within) { background: var(--card-2); }
+.log-source { font: inherit; color: var(--accent-ink); border: 0; background: transparent; text-align: start; }
+.log-overview [data-tone="warn"] { color: var(--amber); font-weight: 650; }
+.log-overview [data-tone="danger"] { color: var(--red); font-weight: 650; }
+#logPre mark { color: var(--ink); background: color-mix(in srgb, var(--amber) 38%, var(--card)); }
+#logPre mark.current { background: var(--accent); color: var(--on-accent); }
+.shortcut-help details { border-top: 1px solid var(--line); padding-top: 12px; }

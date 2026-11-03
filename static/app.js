@@ -3,6 +3,7 @@ import { initOps, renderOps, closeOps } from './js/ops.js';
 import { initFolders, showFilePage, closeFolderDialog } from './js/folders.js';
 import { initFileSearch, stopFilePreview } from './js/file-search.js';
 import { initAppearance, renderAppearance } from './js/appearance.js';
+import { NAV, KEYS, shortcut } from './js/shortcuts.js';
 /* ============================================================
    app.js — 入口：视图切换 / 轮询 / 命令面板 / 总控台自身
    ============================================================ */
@@ -16,8 +17,7 @@ import { $, el, setText, setChildren, icon, escapeHtml,
 import { renderLaunchpad, toggleApp, closePortDiagnostic, closeAppDiagnosis } from './js/launchpad.js';
 import { renderServices, observePortDiscovery,
   suspendPortDiscovery } from './js/services.js';
-import { initWidgets, renderWidgets, refreshCenterPages, openLogsCenter,
-  openSettingsCenter, resetFeedBaseline } from './js/widgets.js';
+import { initWidgets, renderWidgets, refreshCenterPages, resetFeedBaseline } from './js/widgets.js';
 import { buildGlyphGrid, initAppModal, initLogDrawer, openConfirm,
   openAppModal, closeAppModal, closeConfirm, openLogs, closeLogs,
   openConsoleLog } from './js/overlays.js';
@@ -310,6 +310,46 @@ function render() {
   renderOps(state.data);
   renderAppearance();
   firstRender = false;
+  if (pendingGlance) revealGlanceApp();
+}
+
+let pendingGlance = null;
+function revealGlanceApp() {
+  if (!pendingGlance || !state.data || state.data.sampledAt === null) return;
+  const { id, action } = pendingGlance;
+  pendingGlance = null;
+  const app = state.data.apps?.find(a => a.id === id);
+  if (!app) return toast('启动台中没有这张卡片');
+  if (action === 'log') { switchView('logs'); openLogs(app); return; }
+  switchView('launchpad');
+  const card = $('.app-card[data-key="' + CSS.escape(id) + '"]');
+  if (!card) return;
+  if (card.classList.contains('ops-filtered')) $('.ops-tag[data-category=""]')?.click();
+  if (card.hidden) $('#' + (app.kind === 'task' ? 'taskFilter' : 'svcFilter') + ' .fchip')?.click();
+  card.focus({ preventScroll: true }); card.scrollIntoView({ block: 'center' });
+}
+window.__showGlanceApp = (id, action) => {
+  pendingGlance = { id, action };
+  revealGlanceApp();
+};
+function readGlanceLink() {
+  const link = new URLSearchParams(location.hash.slice(1));
+  const id = link.get('app') || link.get('log');
+  if (!id) return;
+  history.replaceState(null, '', location.pathname + location.search);
+  window.__showGlanceApp(id, link.has('app') ? 'show' : 'log');
+}
+window.addEventListener('hashchange', readGlanceLink);
+let glanceWindow;
+function openGlance() {
+  try {
+    if (glanceWindow && !glanceWindow.closed && glanceWindow.location.pathname === '/glance') {
+      glanceWindow.focus();
+      return;
+    }
+  } catch { /* The named window may have navigated to another origin. */ }
+  glanceWindow = window.open('/glance', 'console-glance', 'popup,width=440,height=600');
+  if (glanceWindow) glanceWindow.focus(); else toast('请允许弹窗以打开图标总览');
 }
 
 function showConsoleActivationInfo(action) {
@@ -469,20 +509,15 @@ function paletteActions() {
     items.push({ icon: 'file-text', title: '查看日志 · ' + name, hint: '日志', on: running, run: () => openLogs(a) });
     items.push({ icon: 'pencil', title: '编辑 ' + name, hint: '', on: running, run: () => openAppModal(a) });
   }
-  items.push({ icon: 'layout-grid', title: '切换到启动台', hint: '视图', run: () => switchView('launchpad') });
-  items.push({ icon: 'activity', title: '切换到服务监控', hint: '视图', run: () => switchView('services') });
-  items.push({
-    icon: 'file-text',
-    title: '打开日志中心',
-    hint: '日志 · Ctrl/⌘ J',
-    run: openLogsCenter,
-  });
-  items.push({
-    icon: 'settings',
-    title: '打开设置中心',
-    hint: '通知 · 外观 · 版本',
-    run: openSettingsCenter,
-  });
+  for (const [i, [view, name]] of NAV.entries()) {
+    // File tools intentionally stay out of the command palette.
+    if (view === 'folders' || view === 'files') continue;
+    items.push({ icon: { launchpad: 'layout-grid', services: 'activity', logs: 'file-text', settings: 'settings' }[view],
+      title: (view === 'logs' || view === 'settings' ? '打开' : '切换到') + name,
+      shortcut: 'Alt+' + (i + 1) + (view === 'logs' ? ' · ' + KEYS.logs : ''), run: () => switchView(view) });
+  }
+  items.push({ icon: 'layout-grid', title: '图标总览', shortcut: KEYS.glance, run: openGlance },
+    { icon: 'terminal', title: '快捷键帮助', shortcut: KEYS.help, run: openShortcutHelp });
   const notifyOn = taskNotificationsEnabled();
   items.push({
     icon: 'clock',
@@ -497,7 +532,7 @@ function paletteActions() {
     hint: '系统 · data/logs/console.log',
     run: openConsoleLog,
   });
-  return items;
+  return items.map(it => ({ ...it, hint: [it.hint, it.shortcut || 'Enter'].filter(Boolean).join(' · ') }));
 }
 
 function paletteFiltered() {
@@ -583,6 +618,7 @@ function execPalette(it) {
 cmdkTrigger.addEventListener('click', openPalette);
 paletteInput.addEventListener('input', () => { paletteSel = 0; renderPalette(); });
 paletteInput.addEventListener('keydown', e => {
+  if (e.isComposing || e.keyCode === 229) return;
   const items = paletteFiltered();
   if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
     e.preventDefault();
@@ -599,31 +635,34 @@ paletteInput.addEventListener('keydown', e => {
 });
 paletteMask.addEventListener('mousedown', e => { if (e.target === paletteMask) closePalette(); });
 
-/* ⌘K / Ctrl+K 呼出命令面板 */
+const shortcutMask = $('#shortcutMask'), shortcutClose = $('#shortcutClose');
+function openShortcutHelp() { openLayer(shortcutMask, shortcutClose); }
+function closeShortcutHelp() { closeLayer(shortcutMask); }
+shortcutClose.addEventListener('click', closeShortcutHelp);
+shortcutMask.addEventListener('mousedown', e => { if (e.target === shortcutMask) closeShortcutHelp(); });
+$('#glanceBtn').append(icon('layout-grid', 17));
+$('#glanceBtn').addEventListener('click', openGlance);
 document.addEventListener('keydown', e => {
-  if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'k') {
-    e.preventDefault();
-    if (paletteMask.classList.contains('open')) closePalette();
-    else if (!activeLayer()) openPalette();
-  }
-});
-/* ⌘J / Ctrl+J 呼出日志中心（⌘L 是浏览器地址栏保留键，无法拦截） */
-document.addEventListener('keydown', e => {
-  if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'j') {
-    e.preventDefault();
-    if (!activeLayer()) openLogsCenter();
-  }
+  const action = shortcut(e);
+  if (!action) return;
+  e.preventDefault();
+  if (action === 'palette' && activeLayer() === paletteMask) return closePalette();
+  if (activeLayer()) return;
+  if (action === 'palette') openPalette();
+  else if (action === 'glance') openGlance();
+  else if (action === 'help') openShortcutHelp();
+  else switchView(action);
 });
 window.__openPalette = openPalette;   // hero 卡等跨模块入口
 
 /* Esc 逐层关闭浮层 */
 document.addEventListener('keydown', e => {
   trapLayerFocus(e);
-  if (e.key === 'Escape') {
+  if (e.key === 'Escape' && !e.isComposing && e.keyCode !== 229) {
     const close = { confirmMask: closeConfirm, portDiagMask: closePortDiagnostic,
       appDiagMask: closeAppDiagnosis, appModalMask: closeAppModal,
       paletteMask: closePalette, logDrawer: closeLogs, opsMask: closeOps,
-      folderMask: closeFolderDialog }[activeLayer()?.id];
+      folderMask: closeFolderDialog, shortcutMask: closeShortcutHelp }[activeLayer()?.id];
     if (close) { e.preventDefault(); close(); }
   }
 });
@@ -652,4 +691,5 @@ initFileSearch();
 applyTheme();
 applyUiTheme(currentUiTheme());
 applyView();
+readGlanceLink();
 poll(true).finally(() => schedulePoll());

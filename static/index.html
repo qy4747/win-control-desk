@@ -103,6 +103,7 @@
               <span class="console-action-label" id="stopConsoleLabel">停止</span>
             </button>
             <button class="icon-btn" id="themeBtn" type="button" title="切换主题" aria-label="切换主题"></button>
+            <button class="icon-btn" id="glanceBtn" type="button" title="图标总览 · Ctrl/⌘+Shift+G" aria-label="图标总览"></button>
             <a class="icon-btn" id="githubLink" href="https://github.com/qy4747/win-control-desk" target="_blank" rel="noopener noreferrer" title="查看源码 · GitHub" aria-label="查看源码（GitHub 仓库）"></a>
           </div>
         </div>
@@ -373,14 +374,16 @@
 
           <section class="view center-page" id="view-logs" aria-labelledby="rail-logs" aria-hidden="true">
             <section class="center-section">
-              <h3>应用日志</h3>
-              <p class="center-hint">选择应用查看输出。停止后的日志仍可查看。</p>
-              <div class="logs-list" id="logsList"></div>
-            </section>
-            <section class="center-section">
-              <h3>总控台日志</h3>
-              <p class="center-hint">总控台自身的运行与诊断记录。</p>
-              <button class="btn" id="consoleLogOpen" type="button">查看总控台日志</button>
+              <div class="log-summary-head">
+                <div><h3>日志目录占用</h3><strong class="log-total mono" id="logsTotal">—</strong></div>
+                <label>排序 <select id="logsSort"><option value="size">占用最大</option><option value="growth">增长最快</option><option value="errors">错误最多</option></select></label>
+              </div>
+              <p class="center-hint">占用包含轮转备份。错误数取自各文件末尾 64 KiB；选择一行查看日志。</p>
+              <p id="logsNotice" role="status">正在读取日志摘要…</p>
+              <div class="log-scroll"><table class="log-overview">
+                <thead><tr><th scope="col">来源</th><th scope="col">当前大小</th><th scope="col">备份大小</th><th scope="col">每小时增长</th><th scope="col">最近修改</th><th scope="col">错误行</th><th scope="col">空字节</th></tr></thead>
+                <tbody id="logsList"></tbody>
+              </table></div>
             </section>
           </section>
 
@@ -645,6 +648,26 @@
   </div>
 </div>
 
+<div class="modal-mask" id="shortcutMask" aria-hidden="true" inert>
+  <section class="modal shortcut-help" role="dialog" aria-modal="true" aria-labelledby="shortcutTitle">
+    <header><h2 id="shortcutTitle">快捷键帮助</h2><button class="btn" type="button" id="shortcutClose">关闭</button></header>
+    <h3>全局操作</h3>
+    <dl><dt>命令面板</dt><dd><kbd>Ctrl/⌘+K</kbd></dd><dt>日志中心</dt><dd><kbd>Ctrl/⌘+J</kbd></dd>
+      <dt>图标总览</dt><dd><kbd>Ctrl/⌘+Shift+G</kbd></dd><dt>快捷键帮助</dt><dd><kbd>?</kbd></dd>
+      <dt>关闭最上层浮层</dt><dd><kbd>Esc</kbd></dd><dt>浮层内切换焦点</dt><dd><kbd>Tab / Shift+Tab</kbd></dd></dl>
+    <h3>切换页面</h3>
+    <ol class="shortcut-nav"><li>启动台 <kbd>Alt+1</kbd></li><li>文件夹 <kbd>Alt+2</kbd></li><li>文件搜索 <kbd>Alt+3</kbd></li>
+      <li>服务监控 <kbd>Alt+4</kbd></li><li>日志中心 <kbd>Alt+5</kbd></li><li>设置中心 <kbd>Alt+6</kbd></li></ol>
+    <details><summary tabindex="0">页面内操作</summary><dl>
+      <dt>主视图导航</dt><dd>方向键切换；Home / End 跳首尾</dd>
+      <dt>命令面板</dt><dd>↑ ↓ 选择，Enter 执行</dd><dt>启动台卡片</dt><dd>Enter 翻面；空格开始排序，方向键移动，空格 / Enter 保存，Esc 取消</dd>
+      <dt>预设包</dt><dd>↓ 展开成员；空格 / Enter 操作或长按，Esc 取消</dd>
+      <dt>文件搜索结果</dt><dd>↑ ↓ 选择，空格预览，Enter 打开，Esc 关闭预览</dd>
+      <dt>日志抽屉</dt><dd>在搜索框按 Enter 跳到下一处匹配</dd>
+      <dt>图标总览</dt><dd>/ 搜索，方向键选图标，Enter 打开；Shift+F10 / 菜单键打开操作，Esc 关闭菜单或清空搜索</dd>
+    </dl></details>
+  </section>
+</div>
 <!-- ===== 危险操作确认模态 ===== -->
 <div class="modal-mask" id="confirmMask" aria-hidden="true" inert>
   <div class="modal modal-sm" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
@@ -666,6 +689,11 @@
   <div class="drawer-head">
     <span id="drawerTitle">日志</span>
     <button class="drawer-close" id="drawerClose" type="button" title="关闭" aria-label="关闭日志"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg></button>
+  </div>
+  <div class="log-tools">
+    <label><input type="checkbox" id="logErrors"> 仅看错误行</label>
+    <input type="search" id="logSearch" aria-label="搜索日志" placeholder="搜索日志 · Enter 下一处">
+    <span id="logMatches" role="status" class="mono"></span>
   </div>
   <div class="drawer-body" id="logBody">
     <pre id="logPre"></pre>

@@ -19,6 +19,7 @@ STATIC = Path(__file__).resolve().parents[1] / 'static'
 sys.path.insert(0, str(STATIC.parent))
 from ops_model import MEMORY_RULES, validate_app_extra
 from ops_monitor import Alerts
+from log_center import ERROR
 GIB = 1024 ** 3
 
 
@@ -91,7 +92,7 @@ class Demo:
             themes.append(meta)
         self.data = dict(apps=apps, services=[], watched=[], watchedKeywords=['ffmpeg'], consolePort=self.port,
             consolePid=99999, consoleCwd='演示：不读取真实工作目录', dataDir='仅内存，不写入正式配置', logsDir='演示日志',
-            platform='win32', version='demo', schemaVersion=9, uiTheme='ops', themes=themes, degraded=False,
+            platform='win32', version='demo', schemaVersion=10, uiTheme='ops', themes=themes, degraded=False,
             degradedReasons=[], configHealth=dict(writable=True, issues=[]), stale=False, notificationStatus='disabled',
             system=dict(cpu=24.6, memoryPercent=58.2, diskWriteBytesPerSec=12*1024**2,
                         commitBytes=20*GIB, commitLimitBytes=64*GIB, commitPercent=31.25, commitPeakBytes=41*GIB,
@@ -210,6 +211,23 @@ class Demo:
     def request(self, method, path, body):
         if path == '/api/state':
             return self.snapshot()
+        if path == '/api/logs/summary':
+            # Synthetic historical sizes; never enumerate the user's log directory.
+            rows = []
+            for app in ([] if self.scenario == 'empty' else self.data['apps']):
+                tail = self.request('GET', '/api/apps/' + app['id'] + '/logs', {})['text']
+                current, backup, growth = {
+                    'comfy': (8_442_880, 24_450_816, 65 * 1024 ** 2),
+                    'broken': (6_571_008, 30 * 1024 ** 2, 512 * 1024 ** 2),
+                }.get(app['id'], (len(tail.encode()), 0, 0))
+                rows.append(dict(appId=app['id'], name=app['name'], bytes=current, backupBytes=backup,
+                    growthBytesPerHour=growth, mtime=time.time()-50, lastLine=tail.splitlines()[-1],
+                    errorCount=sum(bool(ERROR.search(line)) for line in tail.splitlines()), nulDetected='\0' in tail))
+            console = dict(appId='console', name='总控台', bytes=38_272, backupBytes=0,
+                growthBytesPerHour=1024, mtime=time.time(), lastLine='演示总控台已就绪', errorCount=0, nulDetected=False)
+            return dict(apps=rows, console=console, totalBytes=sum(r['bytes']+r['backupBytes'] for r in [*rows, console]))
+        if path == '/api/ops/window' and body.get('operation') == 'focus':
+            return dict(ok=self.app(body['appId'])['running'])
         if path == '/api/demo/reset':
             self.reset()
         elif path == '/api/demo/scenario':
@@ -268,7 +286,10 @@ class Demo:
             app = self.app(parts[3])
             action = parts[4] if len(parts) > 4 else ''
             if action == 'logs':
-                return dict(text='[演示日志] '+app['name']+'\n'+ '\n'.join(self.logs.get(app['id'], ['服务初始化完成', '等待用户操作；不重复打印心跳'])))
+                lines = self.logs.get(app['id'], ['服务初始化完成', '等待用户操作；不重复打印心跳'])
+                if app['id'] == 'broken':
+                    lines = [*lines, 'ERROR 启动脚本不存在', '错误：演示日志包含空字节\0']
+                return dict(text='[演示日志] '+app['name']+'\n'+ '\n'.join(lines))
             if action in ('start', 'stop', 'restart'):
                 return self.operate(app, action)
             if action == 'diagnose':
@@ -320,7 +341,9 @@ class Demo:
 
 
 DEMO_SCRIPT = '''<style>body{padding-bottom:48px}#demoBar{position:fixed;bottom:0;left:184px;right:0;z-index:90;display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:10px 18px;background:#17243b;color:white;font:12px system-ui}#demoBar button,#demoBar select{color:#17243b;background:white;border-radius:5px;padding:4px 8px}#demoBar span{flex:1}@media(max-width:1100px){#demoBar{left:78px}}@media(max-width:600px){#demoBar{left:58px;gap:6px;padding:8px}#demoBar span{display:none}}</style>
-<script>window.open=()=>{alert('演示操作：已模拟打开入口，不访问真实应用或外部页面。');return null;};
+<script>const demoOpen=window.open.bind(window);
+window.open=(url,...args)=>{if(url==='/glance'||(typeof url==='string'&&url.startsWith('/#')))return demoOpen(url,...args);
+ alert('演示操作：已模拟打开入口，不访问真实应用或外部页面。');return null;};
 addEventListener('DOMContentLoaded',()=>{
  document.title='UI 验收 · 假数据';
  const bar=document.createElement('div');bar.id='demoBar';
@@ -354,6 +377,8 @@ class Handler(SimpleHTTPRequestHandler):
         if path in ('/', '/index.html'):
             html = (STATIC/'index.html').read_text(encoding='utf8').replace('</head>', DEMO_SCRIPT+'</head>')
             return self.send_bytes(html.encode(), 'text/html; charset=utf-8')
+        if path == '/glance':
+            return self.send_bytes((STATIC/'glance.html').read_bytes(), 'text/html; charset=utf-8')
         super().do_GET()
 
     def api(self):

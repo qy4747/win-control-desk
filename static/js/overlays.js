@@ -5,6 +5,7 @@
 import { $, el, setText, setChildren, icon, escapeHtml,
   post, postWithTimeout, put, del, act, toast, openLayer, closeLayer, activeLayer,
   GLYPHS, findApp, bumpMutationEpoch, state } from './core.js';
+import { filterLog, logMatches } from './log-model.js';
 
 /* ---------------- DOM 引用 ---------------- */
 const appModalMask = $('#appModalMask'), appModal = $('#appModal'), appModalTitle = $('#appModalTitle');
@@ -735,6 +736,34 @@ let logAppId = null;
 let logRequestSeq = 0;
 let logController = null;
 let logIsConsole = false;
+let logText = null, shownText = '', shownQuery = '', selectedMatch = -1;
+const logSearch = $('#logSearch'), logErrors = $('#logErrors'), matchCount = $('#logMatches');
+function updateMatches() {
+  const count = logPre.querySelectorAll('mark').length;
+  setText(matchCount, !shownQuery ? '' : count ? (selectedMatch + 1) + ' / ' + count : '无匹配');
+}
+function paintLog(reset = false) {
+  if (logText == null) return;
+  const text = filterLog(logText, logErrors.checked), query = logSearch.value;
+  if (!reset && text === shownText && query === shownQuery) return;
+  if (reset) selectedMatch = -1;
+  if (!query) {
+    if (!reset && !shownQuery && text.startsWith(shownText)) logPre.append(text.slice(shownText.length));
+    else logPre.textContent = text;
+  } else {
+    const fragment = document.createDocumentFragment(), matches = logMatches(text, query);
+    let start = 0;
+    selectedMatch = Math.min(selectedMatch, matches.length - 1);
+    matches.forEach(([a, b], i) => {
+      const mark = el('mark'); mark.textContent = text.slice(a, b);
+      mark.classList.toggle('current', i === selectedMatch);
+      fragment.append(text.slice(start, a), mark); start = b;
+    });
+    fragment.append(text.slice(start)); logPre.replaceChildren(fragment);
+  }
+  shownText = text; shownQuery = query;
+  updateMatches();
+}
 
 function logEndpoint(appId) {
   return logIsConsole ? '/api/console/log?tail=300'
@@ -753,6 +782,8 @@ function openLogDrawer(appId, title) {
   logIsConsole = appId === 'console';
   const requestSeq = ++logRequestSeq;
   drawerTitle.textContent = title;
+  logText = null; shownText = shownQuery = logSearch.value = ''; selectedMatch = -1;
+  logErrors.checked = false; setText(matchCount, '');
   logPre.textContent = '加载中…';
   logBody.setAttribute('aria-busy', 'true');
   openLayer(logDrawer, drawerClose);
@@ -772,19 +803,13 @@ async function fetchLogs(appId, requestSeq) {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const j = await r.json();
     if (logAppId !== appId || requestSeq !== logRequestSeq) return;
-    const firstLoad = logPre.textContent === '加载中…';
+    const firstLoad = logText === null;
     const nearBottom = firstLoad ||
       logBody.scrollHeight - logBody.scrollTop - logBody.clientHeight < 48;
-    const text = j.text || '';
-    /* 增量追加新行：全量重写会打断用户选区并让滚动位置漂移。 */
-    const previous = firstLoad ? '' : logPre.textContent;
-    if (previous && text.startsWith(previous)) {
-      logPre.append(document.createTextNode(text.slice(previous.length)));
-    } else {
-      logPre.textContent = text;
-    }
+    logText = j.text || '';
+    paintLog(firstLoad);
     logBody.setAttribute('aria-busy', 'false');
-    if (nearBottom) requestAnimationFrame(() => {
+    if (nearBottom && !logSearch.value) requestAnimationFrame(() => {
       if (logAppId === appId && requestSeq === logRequestSeq) {
         logBody.scrollTop = logBody.scrollHeight;
       }
@@ -806,12 +831,27 @@ export function closeLogs() {
   if (logTimer) { clearTimeout(logTimer); logTimer = null; }
   if (logController) { logController.abort(); logController = null; }
   logAppId = null;
+  logText = null; shownText = shownQuery = '';
+  logPre.replaceChildren();
   logBody.setAttribute('aria-busy', 'false');
   closeLayer(logDrawer);
   drawerMask.classList.remove('open');
   drawerMask.setAttribute('aria-hidden', 'true');
 }
 export function initLogDrawer() {
+  logSearch.addEventListener('input', () => paintLog(true));
+  logErrors.addEventListener('change', () => paintLog(true));
+  logSearch.addEventListener('keydown', e => {
+    if (e.key !== 'Enter' || e.isComposing || e.keyCode === 229) return;
+    e.preventDefault();
+    const marks = logPre.querySelectorAll('mark');
+    if (!marks.length) return;
+    marks[selectedMatch]?.classList.remove('current');
+    selectedMatch = (selectedMatch + 1) % marks.length;
+    marks[selectedMatch].classList.add('current');
+    marks[selectedMatch].scrollIntoView({ block: 'nearest' });
+    updateMatches();
+  });
   drawerClose.addEventListener('click', closeLogs);
   drawerMask.addEventListener('click', closeLogs);
   document.addEventListener('visibilitychange', () => {

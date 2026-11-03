@@ -116,6 +116,7 @@ def check_required_files() -> str:
         "Makefile",
         "server.py",
         "service_web.py",
+        "log_center.py",
         "start.command",
         "start.bat",
         "tools/win_anchor.py",
@@ -123,6 +124,8 @@ def check_required_files() -> str:
         "docs/screenshots/ops-launchpad.jpg",
         "docs/screenshots/ops-services.jpg",
         "static/index.html",
+        "static/glance.html",
+        "static/js/glance.js",
         "static/app.js",
         "总控台.app/Contents/Info.plist",
         "总控台.app/Contents/MacOS/launcher",
@@ -514,7 +517,7 @@ def check_static_path(source: Path, ref: str) -> bool:
 
 def check_static_references() -> str:
     # All stylesheets, including shared styles and nested material packs.
-    files = [STATIC / "index.html", *sorted(STATIC.rglob("*.css"))]
+    files = [*sorted(STATIC.glob("*.html")), *sorted(STATIC.rglob("*.css"))]
     attr_re = re.compile(r"(?:src|href)\s*=\s*['\"]([^'\"]+)['\"]", re.I)
     url_re = re.compile(r"url\(\s*['\"]?([^'\")\s]+)", re.I)
     css_import = re.compile(r"@import\s+['\"]([^'\"]+)['\"]", re.I)
