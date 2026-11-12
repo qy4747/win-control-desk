@@ -32,36 +32,17 @@ export function quickAddPayload(row) {
 }
 
 export function aiHandoff(rows, ctx = {}) {
-  const apps = rows.map(r => {
-    const spec = { name: r.name || baseName(r.exe), pid: r.pid, created: r.created, kind: r.kind === 'service' ? 'service' : 'desktop' };
-    if (r.card?.state === 'similar') spec.appId = r.card.id;
-    if (r.kind === 'service' && r.ports?.length) spec.port = r.ports[0];
-    return spec;
-  });
-  const lines = rows.map(r => '- ' + (r.name || baseName(r.exe)) + '：' + r.exe
-    + (r.ports?.length ? '，端口 ' + r.ports.join('、') : '')
-    + (r.card?.state === 'similar' ? '，可能对应已有卡片「' + r.card.name + '」（未关联）' : ''));
   const url = 'http://127.0.0.1:' + (ctx.port || 9600);
+  const lines = rows.map(r => '- ' + (r.name || baseName(r.exe)) + '  PID ' + r.pid + '  创建 ' + r.created + '  ' + r.exe
+    + (r.kind === 'service' && r.ports?.length ? '  端口 ' + r.ports.join('、') : '')
+    + (r.card?.state === 'similar' ? '  可能对应已有卡片「' + r.card.name + '」（appId ' + r.card.id + '，未关联）' : ''));
   return [
-    '请帮我把以下正在运行的程序加入总控台卡片。',
-    '总控台源码目录：' + (ctx.cwd || '（请确认）'),
-    '总控台地址：' + url,
-    '',
-    '运行中的程序：',
+    '请把下面正在运行的程序加入总控台（源码：' + (ctx.cwd || '请确认') + '，地址：' + url + '）。',
     ...lines,
     '',
-    '处理方式（若源码目录有 skills/win-control-desk-apps/SKILL.md，请先按其流程）：',
-    '1. 运行 `py -3.12 tools/manage_apps.py --url ' + url + ' discover <名称>`，核对 PID 和创建时间仍有效；变化了就重新发现。',
-    '2. 查明真实启动命令、工作目录和关闭方式；不确定的启动或退出参数先问我，不要猜。',
-    '3. 按我的需求补全自定义按钮（actions、front）、相关位置（locations）、窗口关联（window）和关闭脚本（stopAction）；批处理流另建 kind=task 卡片。',
-    '4. 计划放在 tmp/，先 `apply <计划>` 预演并把变更给我确认，再加 `--write` 写入，最后运行 `verify`。',
-    '5. 不要启动、停止或结束任何进程。',
+    '有 skills/win-control-desk-apps/SKILL.md 就按它做；没有就用 `py -3.12 tools/manage_apps.py --url ' + url + ' discover`、`apply <计划>`、`verify`，预演给我确认后再加 `--write`。',
+    '只添加我需求里写到的按钮和位置，没写就只建卡片；启动或关闭参数不确定先问我；不要启动、停止或结束任何进程。',
     '',
-    '我的定制需求：（在这里补充，例如“加一个打开配置目录的按钮”）',
-    '',
-    '计划骨架：',
-    '```json',
-    JSON.stringify({ apps }, null, 2),
-    '```',
+    '我的需求：',
   ].join('\n');
 }

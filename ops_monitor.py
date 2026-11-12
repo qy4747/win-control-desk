@@ -74,6 +74,20 @@ def discovery_card(pid, exe, owners, cards):
     return None
 
 
+LAUNCH_HANDOFF_SEC = 120
+
+
+def launch_handoff_pending(app, now=None):
+    """A desktop launcher that exits within seconds usually handed off to a
+    single instance; wait briefly for it, then report the card as stopped."""
+    last = app.get('lastExit') or {}
+    if app.get('kind') != 'desktop' or app.get('running') or not app.get('expectedRunning'):
+        return False
+    if last.get('durationSec', 999) >= 5 or not isinstance(last.get('at'), (int, float)):
+        return False
+    return (time.time() if now is None else now) - last['at'] < LAUNCH_HANDOFF_SEC
+
+
 def snapshot_delta(history, window):
     if not history:
         return None
@@ -548,7 +562,7 @@ class Monitor:
             if app['associationDetail']:
                 app['statusKnown'] = False
                 app['associationState'] = 'ambiguous'
-            if app.get('kind') == 'desktop' and not app['running'] and app.get('expectedRunning') and (app.get('lastExit') or {}).get('durationSec', 999) < 5:
+            if launch_handoff_pending(app):
                 app['associationState'] = 'pending'
         self.async_checks(data['apps'], cfg.get('rules', []), now)
         with self.lock:

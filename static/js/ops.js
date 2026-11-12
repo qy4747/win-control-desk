@@ -628,7 +628,7 @@ async function openDiscovery(existingId = null) {
   const bar = el('div', 'ops-discovery-bar');
   const handoff = button('', () => copyHandoff([...picked.values()]), 'btn btn-accent');
   if (!existingId) {
-    note(bar, '勾选后复制给 AI：生成包含程序身份和 manage_apps.py 步骤的说明，由 AI 补全按钮、脚本和批处理流，预演确认后再写入。');
+    note(bar, '勾选后复制给 AI：生成一段简短说明（程序身份和接入入口），在末尾写上需求再发送；AI 只添加你写到的按钮，预演确认后再写入。');
     bar.append(handoff); results.before(bar);
   }
   const syncBar = () => { handoff.textContent = '复制给 AI（' + picked.size + '）'; handoff.disabled = !picked.size; };

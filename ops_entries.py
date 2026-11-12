@@ -22,6 +22,11 @@ DESKTOP_LAUNCH_FLAGS = {
     'todesk.exe': ({'--hide', '--show'}, {'--localPort'}),
     'baidunetdisk.exe': ({'NoUpdate'}, set()),
 }
+# Self-updaters relaunch the same desktop app with a marker flag; the instance
+# is still the plain launch. Script hosts are excluded: there it is a user arg.
+UPDATE_RELAUNCH_FLAGS = frozenset({'--updated', '--squirrel-firstrun'})
+SCRIPT_HOSTS = frozenset({'python.exe', 'pythonw.exe', 'node.exe', 'cmd.exe', 'powershell.exe', 'pwsh.exe',
+                          'windowsterminal.exe', 'wt.exe', 'wsl.exe', 'bash.exe', 'conhost.exe', 'openconsole.exe'})
 
 
 def desktop_rule_upgrade_needed(app):
@@ -93,7 +98,7 @@ def instance_args_hash(exe, args, parse=None, launch_modes=False):
             while index < len(tokens):
                 token = tokens[index]
                 key, equals, _ = token.partition('=')
-                if token in flags:
+                if token in flags or token in UPDATE_RELAUNCH_FLAGS:
                     index += 1
                     continue
                 if key in options:
@@ -112,6 +117,8 @@ def instance_args_hash(exe, args, parse=None, launch_modes=False):
     if parse:
         tokens = parse(args)
         if tokens:
+            if os.path.basename(exe).lower() not in SCRIPT_HOSTS:
+                tokens = tokens[:1] + [t for t in tokens[1:] if t not in UPDATE_RELAUNCH_FLAGS]
             args = json.dumps(tokens, ensure_ascii=False)
     return hashlib.sha256(args.strip().encode('utf8')).hexdigest()
 
@@ -211,8 +218,7 @@ def capture_instance_match(api, app, pid):
     rule = dict(exe=row['exe'], argsHash=instance_args_hash(row['exe'], row['args'], parse))
     if parse:
         rule['argsHashVersion'] = 2
-    hosts = {'python.exe', 'pythonw.exe', 'node.exe', 'cmd.exe', 'powershell.exe', 'pwsh.exe',
-             'windowsterminal.exe', 'wt.exe', 'wsl.exe', 'bash.exe', 'conhost.exe', 'openconsole.exe'}
+    hosts = SCRIPT_HOSTS
     window_match = (app.get('windowBinding') or {}).get('match') or {}
     executable = os.path.basename(row['exe']).lower()
     if app.get('kind') == 'desktop' and executable in DESKTOP_LAUNCH_FLAGS and parse:
@@ -572,11 +578,20 @@ def resolve_window(api, app):
             return window_app_property(window['hwnd'], 5) == rule['browserAppId']
         title, expected = window['title'], rule['title']
         if os.path.basename(rule['exe']).lower() in ('chrome.exe', 'msedge.exe'):
+            # Ordinary and --app browser windows share titles such as
+            # "127.0.0.1_/" across services; only installed web apps keep one.
+            from service_web import window_app_property
+            if '._crx_' not in window_app_property(window['hwnd'], 5):
+                return False
             # A saved browser window can later be installed as a web app.
             for suffix in (' - Google Chrome', ' - Microsoft Edge'):
                 title, expected = title.removesuffix(suffix), expected.removesuffix(suffix)
         return title == expected
-    candidates = [w for w in list_windows(api, include_hidden=True) if same_window_executable(w['exe'], rule['exe'])
+    # Members are already verified, so their exact current EXE also counts:
+    # self-updaters such as Squirrel move to a new app-x.y.z directory.
+    live_exe = os.path.normcase((app.get('externalIdentity') or {}).get('exe') or '') if rule['scope'] == 'application' else ''
+    candidates = [w for w in list_windows(api, include_hidden=True)
+                  if (same_window_executable(w['exe'], rule['exe']) or (live_exe and os.path.normcase(w['exe']) == live_exe))
                   and w.get('windowClass') == rule['windowClass'] and w.get('toolWindow') == rule['toolWindow']
                   and (not browser or ordinary_browser_window(w))
                   and (w['pid'] in members if rule['scope'] == 'application' else title_matches(w))]

@@ -186,6 +186,63 @@ while u.GetMessageW(C.byref(m),None,0,0)>0:
         rows[20]['args'] = f'{exe} "H:/scripts/other.ahk"'
         self.assertEqual(entries.instance_candidates(api, rule), [])
 
+    def test_update_relaunch_flag_keeps_desktop_identity_but_not_script_arguments(self):
+        exe = 'C:/Apps/Grok Bot/Grok Bot.exe'
+        parse = server._simple_command_tokens
+        plain = entries.instance_args_hash(exe, f'"{exe}"', parse)
+        self.assertEqual(entries.instance_args_hash(exe, f'"{exe}" --updated', parse), plain)
+        self.assertEqual(entries.instance_args_hash(exe, f'"{exe}" --squirrel-firstrun', parse), plain)
+        self.assertNotEqual(entries.instance_args_hash(exe, f'"{exe}" --profile other', parse), plain)
+        self.assertNotEqual(entries.instance_args_hash(exe, f'"{exe}" --updated', None), plain)
+        python = 'C:/Python/python.exe'
+        self.assertNotEqual(entries.instance_args_hash(python, f'{python} app.py --updated', parse),
+                            entries.instance_args_hash(python, f'{python} app.py', parse))
+        typeless = 'C:/Apps/Typeless/Typeless.exe'
+        self.assertEqual(entries.instance_args_hash(typeless, f'"{typeless}" --updated', parse, launch_modes=3),
+                         entries.instance_args_hash(typeless, f'"{typeless}"', parse, launch_modes=3))
+
+    def test_application_window_follows_verified_instance_into_new_update_directory(self):
+        old, new = 'C:/Factory/app-1.2.0/factory.exe', 'C:/Factory/app-1.9.0/factory.exe'
+        rule = dict(exe=old, windowClass='Main', toolWindow=False, scope='application', title='Factory')
+        row = dict(hwnd=123, pid=20, created='new', exe=new, title='Factory', windowClass='Main', toolWindow=False)
+        app = dict(id='factory', externalIdentity=dict(pid=20, created='new', exe=new),
+                   windowBinding=dict(hwnd=99, pid=10, created='old', exe=old, match=rule))
+        api = types.SimpleNamespace(IS_WIN=True, managed_pids=lambda app: [20])
+        with mock.patch.object(entries, 'list_windows', return_value=[row]), \
+             mock.patch.object(entries, 'window_api') as native:
+            native.return_value.SetPropW.return_value = True
+            bound = entries.resolve_window(api, app)
+            self.assertEqual((bound['hwnd'], bound['match']['exe']), (123, new))
+            # A window outside the verified members never qualifies, even with the live EXE.
+            api.managed_pids = lambda app: [21]
+            with self.assertRaisesRegex(ValueError, '尚未找到'):
+                entries.resolve_window(api, app)
+            # Without a live identity the stored path stays exact.
+            api.managed_pids = lambda app: [20]
+            with self.assertRaisesRegex(ValueError, '尚未找到'):
+                entries.resolve_window(api, dict(app, externalIdentity=None))
+
+    def test_plain_browser_title_is_not_a_window_identity(self):
+        rule = dict(exe='chrome.exe', windowClass='Chrome_WidgetWin_1', toolWindow=False, scope='title', title='127.0.0.1_/')
+        app = dict(id='svc', windowBinding=dict(hwnd=99, pid=10, created='old', exe='chrome.exe', match=rule))
+        other = dict(hwnd=123, pid=20, created='new', exe='chrome.exe', title='127.0.0.1_/',
+                     windowClass='Chrome_WidgetWin_1', toolWindow=False)
+        import service_web
+        with mock.patch.object(entries, 'list_windows', return_value=[other]), \
+             mock.patch.object(service_web, 'window_app_property', return_value='Chrome'), \
+             mock.patch.object(entries, 'window_api') as native:
+            with self.assertRaisesRegex(ValueError, '尚未找到'):
+                entries.resolve_window(types.SimpleNamespace(IS_WIN=True), app)
+            native.return_value.SetPropW.assert_not_called()
+
+    def test_launch_handoff_pending_expires(self):
+        from ops_monitor import launch_handoff_pending
+        app = dict(kind='desktop', running=False, expectedRunning=True, lastExit=dict(code=0, at=1000, durationSec=0.6))
+        self.assertTrue(launch_handoff_pending(app, now=1030))
+        self.assertFalse(launch_handoff_pending(app, now=1000 + 121))
+        self.assertFalse(launch_handoff_pending(dict(app, lastExit=dict(app['lastExit'], durationSec=30)), now=1030))
+        self.assertFalse(launch_handoff_pending(dict(app, running=True), now=1030))
+        self.assertFalse(launch_handoff_pending(dict(app, kind='service'), now=1030))
     def test_tunnel_profile_identity_does_not_depend_on_launcher_directory(self):
         exe = os.path.abspath('tunnel-client.exe')
         directory = os.path.abspath('profiles')

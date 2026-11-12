@@ -24,15 +24,14 @@ test('quick add relaunches ordinary programs but keeps interpreters as observati
   assert.equal(py.command, ''); assert.equal(py.cwd, null); assert.equal(py.port, 8899); assert.equal(py.kind, 'service');
 });
 
-test('AI handoff carries identities, plan skeleton and the no-start/stop boundary', () => {
+test('AI handoff stays short: identities, entry point and the no-start/stop boundary only', () => {
   const text = aiHandoff([items[0], items[3]], { cwd: 'D:\\console', port: 9601 });
   assert.match(text, /D:\\console/);
   assert.match(text, /--url http:\/\/127\.0\.0\.1:9601 discover/);
   assert.match(text, /不要启动、停止或结束任何进程/);
-  assert.match(text, /可能对应已有卡片「音乐」/);
-  const plan = JSON.parse(text.split('```json\n')[1].split('\n```')[0]);
-  assert.deepEqual(plan.apps, [
-    { name: '画图', pid: 1, created: 'a', kind: 'desktop' },
-    { name: '音乐', pid: 4, created: 'd', kind: 'desktop', appId: 'm1' },
-  ]);
+  assert.match(text, /画图  PID 1  创建 a  C:\\Apps\\Paint\\paint\.exe/);
+  assert.match(text, /可能对应已有卡片「音乐」（appId m1，未关联）/);
+  assert.match(text, /没写就只建卡片/);
+  assert.doesNotMatch(text, /```/);
+  assert.ok(text.split('\n').length <= 9, text);
 });
