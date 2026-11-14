@@ -6,7 +6,7 @@ import time
 import urllib.parse
 
 from ops_model import validate_rules, validate_presets, validate_stop_action, reconcile_app_presets
-from ops_entries import list_windows, bind_window, operate_window, capture_instance_match, refresh_instance, service_identity, verify_instance_ownership, same_window_executable
+from ops_entries import list_windows, bind_window, operate_window, capture_instance_match, refresh_instance, service_identity, verify_instance_ownership, same_app_executable, node_mode_helper, NODE_HELPER_ERROR, same_window_executable
 
 
 def runtime(handler):
@@ -109,7 +109,7 @@ def post(handler, path):
                             table = api._win_process_table()
                             candidates = [p for p in members if expected_exe and (
                                 same_window_executable(table.get(p, {}).get('exe'), expected_exe) if expected_rule.get('windowClass')
-                                else os.path.normcase(table.get(p, {}).get('exe') or '') == os.path.normcase(expected_exe))]
+                                else same_app_executable(table.get(p, {}).get('exe'), expected_exe))]
                             roots = [p for p in candidates if not any(
                                 p in api._win_tree_of(other, table) for other in candidates if other != p)]
                             if len(roots) == 1:
@@ -177,6 +177,8 @@ def import_process(monitor, data):
     row = api._win_process_table(refresh=True).get(pid)
     if not row or not row.get('exe') or data.get('created') != row['identity'] or api.process_uid(pid) != api.SELF_UID:
         raise ValueError('进程已退出、身份变化或不属于当前用户，请重新发现')
+    if node_mode_helper(row['exe'], row.get('args'), getattr(api, '_simple_command_tokens', None)):
+        raise ValueError(NODE_HELPER_ERROR)
     current_id = data.get('appId')
     fields, error = api.validate_app_fields(data, partial=bool(current_id))
     if error:
@@ -192,7 +194,11 @@ def import_process(monitor, data):
             raise ValueError('卡片不存在')
         if app and api.app_running(app):
             current_members = set(api.managed_pids(app))
-            if not replace_running or not current_members or not current_members.issubset(selected_members):
+            root = api._win_process_table().get((app.get('externalIdentity') or {}).get('pid'), {})
+            # A card wrongly tied to a Node-mode helper may move to the real app.
+            helper_root = bool(root) and node_mode_helper(root.get('exe'), root.get('args'),
+                                                         getattr(api, '_simple_command_tokens', None))
+            if not replace_running or not current_members or not (helper_root or current_members.issubset(selected_members)):
                 raise ValueError('卡片已有运行实例；仅可明确改关联到包含原实例的宿主进程')
         if not app:
             app = copy.deepcopy(api.Config.APP_DEFAULT)

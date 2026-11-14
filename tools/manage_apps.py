@@ -67,11 +67,17 @@ def prepare(spec, current, processes, windows):
         fields.setdefault('shell', 'cmd')
         fields.setdefault('command', '')
         if process:
+            if process.get('helper'):
+                raise ValueError(spec['name']+': 所选进程是辅助进程，请改选应用主进程')
             exe = Path(process['exe'])
-            fields.setdefault('cwd', str(exe.parent))
+            launcher = process.get('launcher') or {}
+            # Versioned install directories disappear on update; prefer the stable launcher.
+            fields.setdefault('cwd', launcher.get('cwd') or str(exe.parent))
             # Interpreters need the actual entry script and working directory.
             if not fields['command'] and exe.name.lower() not in ('python.exe','pythonw.exe','node.exe','cmd.exe','powershell.exe','pwsh.exe','windowsterminal.exe','wt.exe','wsl.exe','bash.exe','conhost.exe','openconsole.exe'):
-                fields['command'] = subprocess.list2cmdline([str(exe)])
+                fields['command'] = launcher.get('command') or subprocess.list2cmdline([str(exe)])
+    if fields.get('kind', (current or {}).get('kind')) == 'desktop' and fields.get('port'):
+        raise ValueError(spec['name']+': 桌面应用不填端口（多为每次启动随机分配）；有固定网页端口的请建 service 卡片')
     actions = copy.deepcopy((current or {}).get('actions', []))
     for item in spec.get('locations', []):
         path = item['path']
@@ -150,9 +156,9 @@ def main():
     windows = client.request('GET','/api/ops/windows')['items']
     if args.operation == 'discover':
         query = args.query.casefold()
-        selected = [p for p in processes if query in (str(p['pid'])+' '+p['name']+' '+p['exe']).casefold()]
+        selected = [p for p in processes if query in (str(p['pid'])+' '+p['name']+' '+(p.get('title') or '')+' '+p['exe']).casefold()]
         pids = {p['pid'] for p in selected}
-        result = dict(processes=[{k:p[k] for k in ('pid','created','name','exe','ports','kind')} for p in selected],
+        result = dict(processes=[{k:p.get(k) for k in ('pid','created','name','title','exe','ports','kind','helper','launcher')} for p in selected],
             windows=[w for w in windows if w['pid'] in pids or query in w['title'].casefold()],
             cards=[dict(id=a['id'],name=a['name'],running=a.get('running')) for a in client.state['apps']])
         print(json.dumps(result,ensure_ascii=False,indent=2)); return

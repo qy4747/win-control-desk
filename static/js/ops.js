@@ -639,7 +639,7 @@ async function openDiscovery(existingId = null) {
     setText(summary, '未添加 ' + counts.unadded + ' 个 · 可能对应未关联卡片 ' + counts.similar + ' 个 · 已有卡片 ' + counts.managed + ' 个');
     for (const row of discoveryRows(items, search.value, unadded.checked)) {
       const item = el('div', 'ops-discovery-row'); item.dataset.state = row.card?.state || 'unadded';
-      if (!existingId && row.card?.state !== 'managed') {
+      if (!existingId && row.card?.state !== 'managed' && !row.helper) {
         const pick = el('input'); pick.type = 'checkbox'; pick.checked = picked.has(rowKey(row));
         pick.setAttribute('aria-label', '选择 ' + row.name + ' 复制给 AI');
         pick.addEventListener('change', () => { if (pick.checked) picked.set(rowKey(row), row); else picked.delete(rowKey(row)); syncBar(); });
@@ -651,9 +651,11 @@ async function openDiscovery(existingId = null) {
         tag.textContent = row.card.state === 'managed' ? '已有卡片：' + row.card.name : '可能是「' + row.card.name + '」，未关联';
         desc.append(tag);
       }
-      note(desc, 'PID ' + row.pid + ' · ' + (row.ports.map(p => ':' + p).join(' ') || '无监听端口') + '\n' + row.exe);
+      if (row.helper) { const tag = el('span', 'ops-discovery-tag'); tag.textContent = '辅助进程，不能单独加入'; desc.append(tag); }
+      note(desc, (row.title && row.title !== row.name ? '窗口：' + row.title + '\n' : '') + 'PID ' + row.pid + ' · ' + (row.ports.map(p => ':' + p).join(' ') || '无监听端口') + '\n' + row.exe);
       item.append(desc);
-      if (existingId) item.append(button('关联', () => importEditor(row, existingId)));
+      if (row.helper) { /* Node-mode/child helpers are rejected by the backend; offer no add path. */ }
+      else if (existingId) item.append(button('关联', () => importEditor(row, existingId)));
       else if (row.card?.state === 'managed') item.append(button('查看卡片', () => openDetails(row.card.id)));
       else {
         if (row.card?.state === 'similar') item.append(button('关联到此卡片', () => importEditor(row, row.card.id)));

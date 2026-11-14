@@ -10,7 +10,7 @@ function dirName(path) { const s = String(path || ''); const i = Math.max(s.last
 export function discoveryRows(items, query = '', unaddedOnly = true) {
   const q = query.trim().toLowerCase();
   return (items || []).filter(r => !(unaddedOnly && r.card?.state === 'managed')
-    && (!q || (r.name + ' ' + r.exe + ' ' + r.pid + ' ' + (r.command || '')).toLowerCase().includes(q)));
+    && (!q || (r.name + ' ' + (r.title || '') + ' ' + r.exe + ' ' + r.pid + ' ' + (r.command || '')).toLowerCase().includes(q)));
 }
 
 export function discoveryCounts(items) {
@@ -20,14 +20,16 @@ export function discoveryCounts(items) {
 }
 
 /* Interpreters need the real entry script, so they become observation cards;
-   ordinary programs can be relaunched from their own exe. */
+   ordinary programs relaunch from the stable launcher above a versioned
+   install directory when the backend found one, else from their own exe. */
 export function quickAddPayload(row) {
   const host = SHARED_HOSTS.has(baseName(row.exe));
   const service = row.kind === 'service';
+  const launcher = !host && row.launcher;
   return {
     pid: row.pid, created: row.created, name: row.name || baseName(row.exe), kind: service ? 'service' : 'desktop',
-    command: host || !row.exe ? '' : '"' + row.exe + '"', shell: 'cmd',
-    cwd: host ? null : dirName(row.exe) || null, port: service && row.ports?.length ? row.ports[0] : null,
+    command: launcher ? launcher.command : host || !row.exe ? '' : '"' + row.exe + '"', shell: 'cmd',
+    cwd: launcher ? launcher.cwd : host ? null : dirName(row.exe) || null, port: service && row.ports?.length ? row.ports[0] : null,
   };
 }
 

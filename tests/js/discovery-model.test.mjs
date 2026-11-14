@@ -24,6 +24,13 @@ test('quick add relaunches ordinary programs but keeps interpreters as observati
   assert.equal(py.command, ''); assert.equal(py.cwd, null); assert.equal(py.port, 8899); assert.equal(py.kind, 'service');
 });
 
+test('quick add uses the stable launcher above a versioned install directory', () => {
+  const row = { pid: 5, created: 'e', name: 'Factory', exe: 'C:\\F\\app-1.10.0\\factory.exe', ports: [], kind: 'desktop',
+    launcher: { command: '"C:\\F\\factory.exe"', cwd: 'C:\\F' } };
+  const payload = quickAddPayload(row);
+  assert.equal(payload.command, '"C:\\F\\factory.exe"'); assert.equal(payload.cwd, 'C:\\F'); assert.equal(payload.port, null);
+  assert.equal(quickAddPayload({ ...items[1], launcher: { command: 'x', cwd: 'y' } }).command, '');
+});
 test('AI handoff stays short: identities, entry point and the no-start/stop boundary only', () => {
   const text = aiHandoff([items[0], items[3]], { cwd: 'D:\\console', port: 9601 });
   assert.match(text, /D:\\console/);

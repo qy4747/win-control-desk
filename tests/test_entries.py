@@ -243,6 +243,74 @@ while u.GetMessageW(C.byref(m),None,0,0)>0:
         self.assertFalse(launch_handoff_pending(dict(app, lastExit=dict(app['lastExit'], durationSec=30)), now=1030))
         self.assertFalse(launch_handoff_pending(dict(app, running=True), now=1030))
         self.assertFalse(launch_handoff_pending(dict(app, kind='service'), now=1030))
+    def test_squirrel_update_directory_is_the_same_application(self):
+        with tempfile.TemporaryDirectory() as root:
+            for name in ('Update.exe', 'factory.exe', 'app-1.9.0/factory.exe', 'app-1.10.0/factory.exe',
+                         'app-1.10.0/other.exe'):
+                path = Path(root, name); path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(b'')
+            old, new = str(Path(root, 'app-1.9.0/factory.exe')), str(Path(root, 'app-1.10.0/factory.exe'))
+            entries.squirrel_parts.cache_clear(); entries._window_exe_key.cache_clear()
+            self.assertTrue(entries.same_window_executable(old, new))
+            self.assertTrue(entries.same_app_executable(old, new))
+            self.assertFalse(entries.same_app_executable(old, str(Path(root, 'app-1.10.0/other.exe'))))
+            parse = server._simple_command_tokens
+            self.assertEqual(entries.instance_args_hash(old, f'"{old}"', parse), entries.instance_args_hash(new, f'"{new}" --updated', parse))
+            self.assertEqual(entries.stable_launcher(new), dict(command='"%s"' % str(Path(root, 'factory.exe')), cwd=str(Path(root))))
+            rows = {20: dict(exe=new, args=f'"{new}"', identity='new', ppid=0),
+                    21: dict(exe=new, args=f'"{new}" --type=renderer', identity='r', ppid=20)}
+            api = types.SimpleNamespace(SELF_PID=1, SELF_UID='mine', _win_process_table=lambda: rows,
+                                        process_uid=lambda pid: 'mine', _simple_command_tokens=parse)
+            rule = dict(exe=old, argsHash=entries.instance_args_hash(old, f'"{old}"', parse), argsHashVersion=2)
+            self.assertEqual(entries.instance_candidates(api, rule), [20])
+            # Without Squirrel's Update.exe a versioned directory is an ordinary exact path.
+            Path(root, 'Update.exe').unlink()
+            entries.squirrel_parts.cache_clear(); entries._window_exe_key.cache_clear()
+            self.assertFalse(entries.same_app_executable(old, new))
+            self.assertEqual(entries.instance_candidates(api, rule), [])
+        entries.squirrel_parts.cache_clear(); entries._window_exe_key.cache_clear()
+
+    def test_versioned_install_prefers_the_single_root_launcher_of_the_same_product(self):
+        with tempfile.TemporaryDirectory() as root:
+            for name in ('ksolaunch.exe', 'wpsupdate.exe', 'notes.exe', '12.1.0.29690/office6/wps.exe'):
+                path = Path(root, name); path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(b'')
+            exe = str(Path(root, '12.1.0.29690/office6/wps.exe'))
+            products = {'wps.exe': 'WPS Office', 'ksolaunch.exe': 'WPS Office', 'wpsupdate.exe': 'WPS Office', 'notes.exe': 'Notes'}
+            with mock.patch.object(entries, '_version_strings', side_effect=lambda p: {'ProductName': products[os.path.basename(p)]}):
+                self.assertEqual(entries.stable_launcher(exe), dict(command='"%s"' % str(Path(root, 'ksolaunch.exe')), cwd=str(Path(root))))
+                products['notes.exe'] = 'WPS Office'
+                self.assertIsNone(entries.stable_launcher(exe))  # ambiguous: keep the exact exe
+            self.assertIsNone(entries.stable_launcher(str(Path(root, 'notes.exe'))))
+
+    def test_node_mode_helpers_are_never_card_identity(self):
+        parse = server._simple_command_tokens
+        exe = 'H:/agy/Antigravity.exe'
+        sidecar = f'"{exe}"  --import=file:///C:/sdk/register_loader.js main.mjs'
+        self.assertTrue(entries.node_mode_helper(exe, sidecar, parse))
+        self.assertTrue(entries.node_mode_helper(exe, f'"{exe}" --type=renderer', parse))
+        self.assertTrue(entries.node_mode_helper(exe, f'"{exe}" server.js', parse))
+        self.assertFalse(entries.node_mode_helper(exe, f'{exe} --remote-debugging-port=9333', parse))
+        self.assertFalse(entries.node_mode_helper('C:/node/node.exe', 'node.exe server.js', parse))
+        rows = {20: dict(exe=exe, args=sidecar, identity='side', ppid=0),
+                30: dict(exe=exe, args=f'{exe} --remote-debugging-port=9333', identity='ide', ppid=0)}
+        api = types.SimpleNamespace(SELF_PID=1, SELF_UID='mine', _win_process_table=lambda: rows,
+                                    process_uid=lambda pid: 'mine', _simple_command_tokens=parse)
+        with self.assertRaisesRegex(ValueError, '辅助进程'):
+            entries.capture_instance_match(api, dict(kind='desktop'), 20)
+        old_rule = dict(exe=exe, argsHash=entries.instance_args_hash(exe, sidecar, parse), argsHashVersion=2)
+        self.assertEqual(entries.instance_candidates(api, old_rule), [])
+        rule = entries.capture_instance_match(api, dict(kind='desktop'), 30)
+        self.assertEqual(entries.instance_candidates(api, rule), [30])
+
+    def test_display_name_is_the_program_not_its_window(self):
+        with mock.patch.object(entries, '_version_strings', return_value={'FileDescription': 'Factory', 'ProductName': 'Factory'}):
+            self.assertEqual(entries.exe_display_name('C:/F/app-1.10.0/factory-desktop.exe'), 'Factory')
+            self.assertEqual(entries.exe_display_name('C:/Py/python.exe'), 'python')
+        with mock.patch.object(entries, '_version_strings', return_value={}):
+            self.assertEqual(entries.exe_display_name('C:/Apps/Grok Bot.exe'), 'Grok Bot')
+        if os.name == 'nt':
+            notepad = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32', 'notepad.exe')
+            if os.path.isfile(notepad):
+                self.assertTrue(entries._version_strings(notepad).get('FileDescription'))
     def test_tunnel_profile_identity_does_not_depend_on_launcher_directory(self):
         exe = os.path.abspath('tunnel-client.exe')
         directory = os.path.abspath('profiles')

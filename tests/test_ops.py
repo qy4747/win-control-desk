@@ -226,7 +226,12 @@ class AlertTests(unittest.TestCase):
         m.check_apps([app], 40, True)
         m.check_apps([app], 50, True)
         self.assertEqual(m.events[-1]['phase'], 'recovered')
-
+        # Desktop apps often choose a new port per launch: never a port alert.
+        m, desktop = self.monitor(), self.app('desktop')
+        desktop.update(port=61001, listening=False)
+        for t in [0, 10, 20, 30]:
+            m.check_apps([desktop], t, True)
+        self.assertFalse([e for e in m.events if e['key'].endswith(':port')])
     def test_manual_stop_pauses_alerts_until_success_or_failure_is_known(self):
         for success in (True, False):
             with self.subTest(success=success):

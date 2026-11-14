@@ -43,13 +43,25 @@ def desktop_rule_upgrade_needed(app):
 
 
 def same_window_executable(left, right):
-    """Match window owners across WindowsApps updates, not arbitrary exe moves.
+    """Match window owners across WindowsApps and Squirrel updates, not arbitrary exe moves.
 
-    Keep the install root, package name, architecture, resource, publisher and
-    relative executable. Only the four-part package version may change.
+    WindowsApps: keep the install root, package name, architecture, resource,
+    publisher and relative executable; only the four-part package version may
+    change. Squirrel: only the app-x.y.z directory under a root that holds
+    Update.exe and the same-name launcher may change.
     This is discovery identity; live PID/created/exe checks remain exact.
     """
     return bool(left and right) and _window_exe_key(left) == _window_exe_key(right)
+
+
+def same_app_executable(left, right):
+    """Exact executable identity, except a Squirrel app-x.y.z update move."""
+    if not (left and right):
+        return False
+    if ntpath.normcase(left) == ntpath.normcase(right):
+        return True
+    a, b = squirrel_parts(left), squirrel_parts(right)
+    return bool(a and a == b)
 
 
 @functools.lru_cache(maxsize=4096)
@@ -61,8 +73,135 @@ def _window_exe_key(path):
         match = re.fullmatch(r'([^_]+)_\d+\.\d+\.\d+\.\d+_([^_]+)_([^_]*)_([^_]+)', package)
         if match and sep and relative:
             return (root, *match.groups(), relative)
+    squirrel = squirrel_parts(path)
+    if squirrel:
+        return ('squirrel', *squirrel)
     return path
 
+
+_SQUIRREL_APP_DIR = re.compile(r'app-\d+(?:\.\d+){1,3}(?:-[0-9a-z.]+)?', re.I)
+
+
+@functools.lru_cache(maxsize=1024)
+def squirrel_parts(path):
+    """(root, relative exe) for <root>/app-x.y.z/<relative> Squirrel installs, else None.
+
+    Squirrel keeps Update.exe and a same-name launcher in the root and moves
+    the real executable to a new app-x.y.z directory on every update."""
+    parts = ntpath.normcase(ntpath.normpath(path or '')).split('\\')
+    for index in range(1, len(parts) - 1):
+        if _SQUIRREL_APP_DIR.fullmatch(parts[index]):
+            root = '\\'.join(parts[:index])
+            if (os.path.isfile(ntpath.join(root, 'update.exe'))
+                    and os.path.isfile(ntpath.join(root, parts[-1]))):
+                return root, '\\'.join(parts[index + 1:])
+            return None
+    return None
+
+
+_VERSION_DIR = re.compile(r'\d+(?:\.\d+){2,3}')
+
+
+@functools.lru_cache(maxsize=512)
+def _version_strings(path):
+    result = {}
+    if os.name != 'nt' or not path:
+        return result
+    try:
+        version = C.WinDLL('version')
+        version.GetFileVersionInfoSizeW.argtypes = [W.LPCWSTR, C.POINTER(W.DWORD)]
+        version.GetFileVersionInfoW.argtypes = [W.LPCWSTR, W.DWORD, W.DWORD, C.c_void_p]
+        version.VerQueryValueW.argtypes = [C.c_void_p, W.LPCWSTR, C.POINTER(C.c_void_p), C.POINTER(W.UINT)]
+        size = version.GetFileVersionInfoSizeW(path, None)
+        if not size:
+            return result
+        data = C.create_string_buffer(size)
+        if not version.GetFileVersionInfoW(path, 0, size, data):
+            return result
+        pointer, length = C.c_void_p(), W.UINT()
+        pairs = []
+        if version.VerQueryValueW(data, '\\VarFileInfo\\Translation', C.byref(pointer), C.byref(length)) and length.value >= 4:
+            raw = C.string_at(pointer, length.value)
+            pairs = [(int.from_bytes(raw[i:i + 2], 'little'), int.from_bytes(raw[i + 2:i + 4], 'little'))
+                     for i in range(0, length.value - 3, 4)]
+        for lang, codepage in pairs + [(0x0409, 0x04b0), (0x0804, 0x04b0)]:
+            for key in ('FileDescription', 'ProductName'):
+                if key in result:
+                    continue
+                query = '\\StringFileInfo\\%04x%04x\\%s' % (lang, codepage, key)
+                if version.VerQueryValueW(data, query, C.byref(pointer), C.byref(length)) and length.value:
+                    value = C.wstring_at(pointer, length.value).strip('\0 ').strip()
+                    if value:
+                        result[key] = value
+    except (OSError, ValueError):
+        return {}
+    return result
+
+
+def exe_display_name(path, fallback=None):
+    """The program's own name (version resource), never a window or session title."""
+    stem = fallback or os.path.splitext(os.path.basename(path or ''))[0]
+    if os.path.basename(path or '').lower() in SCRIPT_HOSTS:
+        return stem
+    info = _version_strings(path or '')
+    return info.get('FileDescription') or info.get('ProductName') or stem
+
+
+def stable_launcher(path):
+    """Launcher above a versioned install directory, so cards survive updates.
+
+    Squirrel: the same-name launcher in the root. Other versioned directories
+    (e.g. <root>/12.1.0.29690/office6/wps.exe): the only root executable of the
+    same product that is not an updater/uninstaller."""
+    squirrel = squirrel_parts(path)
+    if squirrel:
+        root = ntpath.dirname(ntpath.normpath(path))
+        while ntpath.normcase(root) != squirrel[0]:
+            root = ntpath.dirname(root)
+        launcher = ntpath.join(root, ntpath.basename(path))
+        return dict(command='"%s"' % launcher, cwd=root)
+    parts = ntpath.normpath(path or '').split('\\')
+    for index in range(1, len(parts) - 1):
+        if _VERSION_DIR.fullmatch(parts[index]):
+            root = '\\'.join(parts[:index])
+            product = _version_strings(path).get('ProductName')
+            if not product:
+                return None
+            try:
+                names = [n for n in os.listdir(root) if n.lower().endswith('.exe')
+                         and not re.search(r'(?i)update|uninst|setup|crash|repair', n)]
+            except OSError:
+                return None
+            matches = [ntpath.join(root, n) for n in names
+                       if _version_strings(ntpath.join(root, n)).get('ProductName') == product]
+            if len(matches) == 1:
+                return dict(command='"%s"' % matches[0], cwd=root)
+            return None
+    return None
+
+
+NODE_HELPER_ERROR = '所选进程是应用以 Node 模式运行的辅助进程（带 --import/--type 或脚本入口），请改选应用主进程'
+
+
+def node_mode_helper(exe, args, parse=None):
+    """Electron/Chromium executables re-run as Node or as child helpers
+    (--import=loader main.mjs, --type=renderer) are not the application."""
+    name = os.path.basename(exe or '').lower()
+    if not name or name in SCRIPT_HOSTS:
+        return False
+    tokens = (parse(args) if parse else None) or (args or '').split()
+    for token in tokens[1:]:
+        lowered = token.lower()
+        if lowered.startswith(('--import=', '--require=', '--type=')) or lowered in ('--import', '--require'):
+            return True
+        if not lowered.startswith('-') and lowered.endswith(('.js', '.mjs', '.cjs')):
+            return True
+    return False
+
+
+def _hash_exe_text(text):
+    squirrel = squirrel_parts(text)
+    return ntpath.join(squirrel[0], squirrel[1]) if squirrel else text
 
 def browser_card_rule(api, app):
     """Only plain default-profile browser cards; service/PWA profiles stay exact."""
@@ -94,7 +233,7 @@ def instance_args_hash(exe, args, parse=None, launch_modes=False):
             flags, options = DESKTOP_LAUNCH_FLAGS.get(os.path.basename(exe).lower(), (set(), set()))
             if launch_modes == 4 and os.path.basename(exe).lower() == 'quark_cloud_drive.exe':
                 flags = flags | {'--brand-clouddrive'}
-            effective, index = [os.path.normcase(exe)], 1
+            effective, index = [os.path.normcase(_hash_exe_text(exe))], 1
             while index < len(tokens):
                 token = tokens[index]
                 key, equals, _ = token.partition('=')
@@ -118,7 +257,7 @@ def instance_args_hash(exe, args, parse=None, launch_modes=False):
         tokens = parse(args)
         if tokens:
             if os.path.basename(exe).lower() not in SCRIPT_HOSTS:
-                tokens = tokens[:1] + [t for t in tokens[1:] if t not in UPDATE_RELAUNCH_FLAGS]
+                tokens = [_hash_exe_text(tokens[0])] + [t for t in tokens[1:] if t not in UPDATE_RELAUNCH_FLAGS]
             args = json.dumps(tokens, ensure_ascii=False)
     return hashlib.sha256(args.strip().encode('utf8')).hexdigest()
 
@@ -210,6 +349,8 @@ def capture_instance_match(api, app, pid):
     if not row.get('exe') or not row.get('args') or api.process_uid(pid) != api.SELF_UID:
         raise ValueError('无法读取应用身份，请先关联运行实例')
     parse = getattr(api, '_simple_command_tokens', None)
+    if node_mode_helper(row['exe'], row['args'], parse):
+        raise ValueError(NODE_HELPER_ERROR)
     browser = browser_card_rule(api, app) if parse else None
     if browser and same_window_executable(browser['exe'], row['exe']):
         if not default_browser_process(api, row):
@@ -302,7 +443,9 @@ def instance_candidates(api, rule, within=None):
             if rule.get('browserMain') and not default_browser_process(api, row):
                 continue
             if not (same_window_executable(row['exe'], rule['exe']) if window_pids is not None
-                    else os.path.normcase(row['exe']) == os.path.normcase(rule['exe'])):
+                    else same_app_executable(row['exe'], rule['exe'])):
+                continue
+            if node_mode_helper(row['exe'], row.get('args'), getattr(api, '_simple_command_tokens', None)):
                 continue
             if window_pids is not None:
                 if pid not in window_pids:

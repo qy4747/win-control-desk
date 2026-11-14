@@ -44,7 +44,8 @@
 - 运行中更新 `command/cwd/port/kind/shell` 需先停止。前端保留编辑草稿；API 的 `stopBeforeUpdate:true` 提供停止后原子更新。
 - 正常关闭失败保留管理身份；强制结束单独确认。控制台自身退出后，已启动的独立应用继续运行。
 - Windows 的实例匹配、资源统计、动作与强制结束共用独立子卡片边界。窗口绑定与进程归属分别校验，服务网页不纳入服务关闭范围。
-- WindowsApps 的版本归一化集中在 `ops_entries.same_window_executable`；实时 PID、创建时间和 EXE 身份仍精确核对。
+- WindowsApps 的版本归一化集中在 `ops_entries.same_window_executable`；实时 PID、创建时间和 EXE 身份仍精确核对。唯一例外是 Squirrel 安装（根目录有 `Update.exe` 和同名启动程序）：`squirrel_parts` 忽略其下 `app-x.y.z` 目录，窗口规则和参数哈希规则（`same_app_executable`）共用。其他带版本号的安装目录只在新建卡片时改用 `stable_launcher` 找到的根目录启动程序。
+- Electron/Chromium 以 Node 模式或子进程运行的辅助进程（`--import=`、`--type=`、脚本入口，见 `node_mode_helper`）不能作为卡片身份：关联与导入拒绝，自动重找跳过。发现列表名称取程序版本信息（`exe_display_name`），窗口标题只作参考。
 
 ## 配置
 

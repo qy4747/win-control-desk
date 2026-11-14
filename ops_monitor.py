@@ -12,7 +12,8 @@ import time
 import uuid
 
 from ops_model import http_action, number, script_command, preset_steps, PROCESS_MEMORY_METRICS
-from ops_entries import refresh_instance, browser_card_rule, desktop_rule_upgrade_needed, same_window_executable
+from ops_entries import (refresh_instance, browser_card_rule, desktop_rule_upgrade_needed, same_window_executable,
+                         exe_display_name, stable_launcher, node_mode_helper)
 from win_notify import Notifier
 
 LOG = logging.getLogger('console')
@@ -635,7 +636,9 @@ class Monitor:
                 expected_sig = json.dumps(app['probe'], sort_keys=True)+str(app.get('startedAt'))+str(app.get('pid'))
                 if probe['signature'] == expected_sig:
                     app['probeState'] = dict(status='ok' if probe.get('ok') else 'error', checkedAt=probe['checkedAt'])
-            check('port', bool(app.get('port') and not app.get('listening')) if app['running'] and not grace else False,
+            # Desktop apps often pick a new port per launch; only services promise one.
+            port_expected = app.get('port') and app.get('kind') != 'desktop'
+            check('port', bool(port_expected and not app.get('listening')) if app['running'] and not grace else False,
                   '配置端口未监听' if not app.get('listening') else '端口监听中', '端口异常', fail=3, recover=2)
             probe_key = 'app:'+ident+':http'
             latest = app['probeState'].get('checkedAt')
@@ -851,9 +854,16 @@ class Monitor:
                 continue
             if self.api.process_uid(pid) != self.api.SELF_UID:
                 continue
+            # Window titles are sessions/documents ("Review ... - Factory"); keep
+            # them as context only and name the row after the program itself.
+            title = next((t for _, t in visible.get(pid, []) if t), '')
+            launcher = stable_launcher(p['exe']) if p['exe'] else None
             rows.append(dict(pid=pid, created=p['identity'], exe=p['exe'], command=p['args'],
-                             name=visible.get(pid, [(None, p['name'])])[0][1], ports=ports.get(pid, []),
+                             name=exe_display_name(p['exe'], p['name'] if not p['exe'] else None), title=title,
+                             ports=ports.get(pid, []),
                              kind='desktop' if pid in visible else 'service',
+                             helper=node_mode_helper(p['exe'], p['args'], parse),
+                             launcher=launcher,
                              card=discovery_card(pid, p['exe'], owners, cards)))
         return rows
 
